@@ -68,6 +68,9 @@ struct ContentView: View {
 
     @State private var isSidebarVisible = true
 
+    /// When true, the mesh stops rotating and resets to its rest orientation.
+    @State private var isRotationPaused = false
+
     // MARK: - Canvas File State
 
     /// The display name of the current workspace (shown in the top-left header).
@@ -129,7 +132,7 @@ struct ContentView: View {
     var body: some View {
         ZStack {
             // Layer 0: Metal rendering viewport (fills the entire window).
-            MetalView(activeShaders: activeShaders, meshType: meshType, backgroundImage: backgroundImage, dataFlowConfig: dataFlowConfig, paramValues: paramValues)
+            MetalView(activeShaders: activeShaders, meshType: meshType, backgroundImage: backgroundImage, dataFlowConfig: dataFlowConfig, paramValues: paramValues, isRotationPaused: isRotationPaused)
                 .ignoresSafeArea()
 
             // Layer 1: UI overlay (sidebar, buttons, canvas name).
@@ -319,6 +322,16 @@ struct ContentView: View {
                             Image(systemName: "cube.box.fill").font(.title2)
                                 .foregroundColor({ if case .custom = meshType { return Color.blue }; return Color.white }())
                         }.buttonStyle(.plain).help(customFileName ?? String(localized: "Upload Custom Model..."))
+
+                        Divider().frame(height: 24).background(Color.white.opacity(0.3))
+
+                        Button(action: { withAnimation { isRotationPaused.toggle() } }) {
+                            Image(systemName: isRotationPaused ? "arrow.counterclockwise" : "rotate.3d")
+                                .font(.title2)
+                                .foregroundColor(isRotationPaused ? .orange : .white)
+                        }
+                        .buttonStyle(.plain)
+                        .help(isRotationPaused ? String(localized: "Resume Rotation") : String(localized: "Reset & Pause Rotation"))
                     }
                     .padding(10).background(Color.black.opacity(0.6)).cornerRadius(12).padding()
                 }

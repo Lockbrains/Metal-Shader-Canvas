@@ -127,6 +127,9 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     /// Elapsed time in seconds, incremented each frame. Passed to shaders as `uniforms.time`.
     var time: Float = 0
 
+    /// When true, the mesh uses an identity model matrix (no rotation).
+    var isRotationPaused: Bool = false
+
     /// The current shader layer configuration, mirrored from the SwiftUI state.
     var activeShaders: [ActiveShader] = []
     
@@ -279,6 +282,25 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         }
     }
 
+    // MARK: - Alpha Blending Configuration
+
+    /// Configures standard alpha blending ("over" composite) on a pipeline
+    /// color attachment. This enables fragment shaders to output alpha < 1.0
+    /// for transparency effects.
+    ///
+    /// Result formula:
+    ///   RGB   = src.rgb × src.a + dst.rgb × (1 − src.a)
+    ///   Alpha = src.a × 1       + dst.a   × (1 − src.a)
+    private static func configureAlphaBlending(on attachment: MTLRenderPipelineColorAttachmentDescriptor) {
+        attachment.isBlendingEnabled = true
+        attachment.rgbBlendOperation = .add
+        attachment.alphaBlendOperation = .add
+        attachment.sourceRGBBlendFactor = .sourceAlpha
+        attachment.destinationRGBBlendFactor = .oneMinusSourceAlpha
+        attachment.sourceAlphaBlendFactor = .one
+        attachment.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+    }
+
     // MARK: - Shader Update & Compilation
 
     /// Called by MetalView.updateNSView() whenever the SwiftUI shader state changes.
@@ -372,6 +394,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
             pipelineDescriptor.vertexFunction = vertexFunc
             pipelineDescriptor.fragmentFunction = fragFunc
             pipelineDescriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+            Self.configureAlphaBlending(on: pipelineDescriptor.colorAttachments[0])
             pipelineDescriptor.depthAttachmentPixelFormat = .depth32Float
 
             if let mesh = self.mesh {
@@ -489,6 +512,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
             descriptor.vertexFunction = lib.makeFunction(name: "vertex_main")
             descriptor.fragmentFunction = lib.makeFunction(name: "fragment_main")
             descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+            Self.configureAlphaBlending(on: descriptor.colorAttachments[0])
             descriptor.depthAttachmentPixelFormat = .depth32Float
             self.bgBlitPipelineState = try device.makeRenderPipelineState(descriptor: descriptor)
         } catch {
@@ -629,6 +653,9 @@ class MetalRenderer: NSObject, MTKViewDelegate {
             }
 
             // Step 2: Draw the 3D mesh with the user's vertex + fragment shaders.
+            // Two-pass rendering for correct alpha blending on convex meshes:
+            //   Pass A: back faces first  (cull front) — establishes back surface colors
+            //   Pass B: front faces second (cull back)  — blends on top of back faces
             if let pipeline = meshPipelineState, let mesh = mesh {
                 encoder.setRenderPipelineState(pipeline)
                 encoder.setDepthStencilState(depthStencilState)
@@ -636,12 +663,11 @@ class MetalRenderer: NSObject, MTKViewDelegate {
                 let aspect = Float(size.width / size.height)
                 let projectionMatrix = matrix_perspective_right_hand(fovyRadians: Float.pi / 3.0, aspectRatio: aspect, nearZ: 0.1, farZ: 100.0)
                 let viewMatrix = matrix_translation(0, 0, -8.0)
-                let modelMatrix = matrix_rotation(time * 0.3, axis: simd_float3(0, 1, 0))
+                let modelMatrix = isRotationPaused
+                    ? matrix_identity_float4x4
+                    : matrix_rotation(time * 0.3, axis: simd_float3(0, 1, 0))
                 let mvp = matrix_multiply(projectionMatrix, matrix_multiply(viewMatrix, modelMatrix))
                 
-                // Normal matrix = transpose(inverse(modelMatrix))
-                // For uniform-scale rotation-only transforms, modelMatrix itself works,
-                // but we compute it properly for correctness.
                 let normalMatrix = simd_transpose(simd_inverse(modelMatrix))
                 
                 let cameraPosition = simd_float4(0, 0, 8, 0)
@@ -655,7 +681,6 @@ class MetalRenderer: NSObject, MTKViewDelegate {
                 )
                 encoder.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
                 
-                // Bind user parameter buffer at index 2
                 var paramBuffer = ShaderSnippets.packParamBuffer(params: meshParams, values: paramValues)
                 if !paramBuffer.isEmpty {
                     encoder.setVertexBytes(&paramBuffer, length: paramBuffer.count * MemoryLayout<Float>.stride, index: 2)
@@ -666,6 +691,14 @@ class MetalRenderer: NSObject, MTKViewDelegate {
                     encoder.setVertexBuffer(vertexBuffer.buffer, offset: vertexBuffer.offset, index: index)
                 }
 
+                // Pass A: draw back faces (cull front faces)
+                encoder.setCullMode(.front)
+                for submesh in mesh.submeshes {
+                    encoder.drawIndexedPrimitives(type: submesh.primitiveType, indexCount: submesh.indexCount, indexType: submesh.indexType, indexBuffer: submesh.indexBuffer.buffer, indexBufferOffset: submesh.indexBuffer.offset)
+                }
+
+                // Pass B: draw front faces on top (cull back faces)
+                encoder.setCullMode(.back)
                 for submesh in mesh.submeshes {
                     encoder.drawIndexedPrimitives(type: submesh.primitiveType, indexCount: submesh.indexCount, indexType: submesh.indexType, indexBuffer: submesh.indexBuffer.buffer, indexBufferOffset: submesh.indexBuffer.offset)
                 }

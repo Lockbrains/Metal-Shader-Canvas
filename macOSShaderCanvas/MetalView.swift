@@ -82,6 +82,9 @@ struct MetalView: NSViewRepresentable {
     /// Current user parameter values for all shaders (keyed by param name).
     var paramValues: [String: [Float]] = [:]
 
+    /// When true, the mesh stops rotating and resets to its rest orientation.
+    var isRotationPaused: Bool = false
+
     // MARK: - NSViewRepresentable Lifecycle
 
     /// Called ONCE when the SwiftUI view first appears.
@@ -116,9 +119,8 @@ struct MetalView: NSViewRepresentable {
     ///   - context: Provides access to the Coordinator (and thus the renderer).
     func updateNSView(_ nsView: MTKView, context: Context) {
         if let renderer = context.coordinator.renderer {
-            // Forward the current mesh type. MetalRenderer's didSet on currentMeshType
-            // will detect changes and rebuild the mesh + pipeline only when needed.
             renderer.currentMeshType = meshType
+            renderer.isRotationPaused = isRotationPaused
 
             // Forward the shader array. MetalRenderer.updateShaders() performs a diff
             // against the previous array and only recompiles shaders whose code changed.
