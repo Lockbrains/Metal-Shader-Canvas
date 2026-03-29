@@ -4,6 +4,22 @@
     "" : {
 
     },
+    "(%@)" : {
+
+    },
+    "%@: %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@: %2$@"
+          }
+        }
+      }
+    },
+    "%lld" : {
+
+    },
     "%lld / %lld" : {
       "localizations" : {
         "ja" : {
@@ -20,13 +36,103 @@
         }
       }
     },
+    "%lld action%@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$lld action%2$@"
+          }
+        }
+      }
+    },
+    "%lld chars" : {
+
+    },
+    "%lld failed" : {
+
+    },
+    "%lld/%lld" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$lld/%2$lld"
+          }
+        }
+      }
+    },
     "•" : {
+
+    },
+    "→" : {
+
+    },
+    "2D Canvas" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "2D キャンバス"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "2D 画布"
+          }
+        }
+      }
+    },
+    "3D Canvas" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "3D キャンバス"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "3D 画布"
+          }
+        }
+      }
+    },
+    "Accept" : {
+
+    },
+    "Add" : {
+
+    },
+    "Add // @param directives to your shader code" : {
+
+    },
+    "Add Object" : {
 
     },
     "Add parameter to current shader" : {
 
     },
+    "Add text description" : {
+
+    },
+    "Add Text Reference" : {
+
+    },
+    "Adversarial Generation" : {
+
+    },
+    "Adversarial Proposals" : {
+
+    },
     "AI" : {
+
+    },
+    "AI Assistant" : {
 
     },
     "AI Chat" : {
@@ -44,11 +150,39 @@
     "AI Tutorial" : {
 
     },
+    "AI will challenge your shader with alternatives" : {
+
+    },
+    "AI-collaborative 2D shader development" : {
+
+    },
+    "AI-collaborative 3D shader development" : {
+
+    },
     "Anthropic" : {
 
     },
-    "Ask about your shader..." : {
+    "Attach image (or ⌘V to paste)" : {
 
+    },
+    "Attach reference from board" : {
+
+    },
+    "Back to Hub" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ハブに戻る"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "返回 Hub"
+          }
+        }
+      }
     },
     "Background Image" : {
       "localizations" : {
@@ -81,6 +215,18 @@
           }
         }
       }
+    },
+    "Capture current render" : {
+
+    },
+    "Click 'Snapshot' to save parameter states" : {
+
+    },
+    "Collaborative Analysis" : {
+
+    },
+    "Collaborative Discussion" : {
+
     },
     "Color" : {
 
@@ -120,10 +266,16 @@
         }
       }
     },
-    "Data Flow" : {
+    "Custom" : {
+
+    },
+    "Decision: %@" : {
 
     },
     "Describe what shader technique you want to learn." : {
+
+    },
+    "Describe your shader goal..." : {
 
     },
     "Discard & Create New" : {
@@ -161,7 +313,13 @@
     "Double-click to rename" : {
 
     },
+    "Drop references here" : {
+
+    },
     "e.g. Build a cel-shading toon shader" : {
+
+    },
+    "Edit Annotation" : {
 
     },
     "Enter an API key for the selected provider" : {
@@ -186,6 +344,9 @@
     "Extended" : {
 
     },
+    "Failed" : {
+
+    },
     "Float Input" : {
 
     },
@@ -199,6 +360,9 @@
 
     },
     "Float4" : {
+
+    },
+    "Fragment (Color)" : {
 
     },
     "Fragment Layer" : {
@@ -233,6 +397,25 @@
         }
       }
     },
+    "Fragment shaders on a fullscreen quad" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "フルスクリーンクワッド上のフラグメントシェーダー"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "全屏四边形上的片段着色器"
+          }
+        }
+      }
+    },
+    "FS" : {
+
+    },
     "Fullscreen Layer" : {
       "localizations" : {
         "ja" : {
@@ -256,6 +439,12 @@
 
     },
     "Generated Structs" : {
+
+    },
+    "Generating..." : {
+
+    },
+    "H" : {
 
     },
     "Hide Hint" : {
@@ -290,7 +479,23 @@
         }
       }
     },
+    "Image attached" : {
+
+    },
+    "Images, Videos, GIFs, or Text" : {
+
+    },
+    "Implementation" : {
+
+    },
+    "Import file" : {
+
+    },
+    "Iterations will be logged as you collaborate..." : {
+
+    },
     "Layers" : {
+      "extractionState" : "stale",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -305,6 +510,9 @@
           }
         }
       }
+    },
+    "Metal Shader Canvas" : {
+
     },
     "Metal Shader Tutorial" : {
       "localizations" : {
@@ -325,6 +533,9 @@
     "Model" : {
 
     },
+    "Need at least 2 snapshots to compare" : {
+
+    },
     "New Canvas" : {
       "localizations" : {
         "ja" : {
@@ -337,6 +548,22 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "新建 Canvas"
+          }
+        }
+      }
+    },
+    "New Project" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "新規プロジェクト"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "新建项目"
           }
         }
       }
@@ -373,7 +600,41 @@
         }
       }
     },
+    "No constraints defined" : {
+
+    },
+    "No objects yet" : {
+
+    },
     "No parameters declared" : {
+
+    },
+    "No PP layers" : {
+
+    },
+    "No proposals yet" : {
+
+    },
+    "No Recent Projects" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "最近のプロジェクトはありません"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "暂无最近项目"
+          }
+        }
+      }
+    },
+    "No snapshots yet" : {
+
+    },
+    "Object" : {
 
     },
     "Open Canvas" : {
@@ -411,7 +672,13 @@
     "OpenAI" : {
 
     },
-    "Parameters" : {
+    "Parameter Tuning" : {
+
+    },
+    "Parameters will be defined during the planning phase..." : {
+
+    },
+    "Partial" : {
 
     },
     "Post Processing" : {
@@ -478,10 +745,50 @@
         }
       }
     },
+    "Project Document" : {
+
+    },
+    "Project Title" : {
+
+    },
+    "Proposed Parameter Changes:" : {
+
+    },
     "Provider" : {
 
     },
+    "R" : {
+
+    },
     "Ready" : {
+
+    },
+    "Recent Projects" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "最近のプロジェクト"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "最近的项目"
+          }
+        }
+      }
+    },
+    "Reference Input" : {
+
+    },
+    "References" : {
+
+    },
+    "Reject" : {
+
+    },
+    "Remove" : {
 
     },
     "Remove Background" : {
@@ -500,6 +807,25 @@
         }
       }
     },
+    "Remove from Recents" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "最近のリストから削除"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "从最近项目中移除"
+          }
+        }
+      }
+    },
+    "Reset to 0°" : {
+
+    },
     "Reset to Blank Template" : {
       "localizations" : {
         "ja" : {
@@ -515,6 +841,21 @@
           }
         }
       }
+    },
+    "Reset Zoom/Pan" : {
+
+    },
+    "Restore this snapshot" : {
+
+    },
+    "Revert to shared FS" : {
+
+    },
+    "Revert to shared VS" : {
+
+    },
+    "Rot" : {
+
     },
     "Save" : {
       "localizations" : {
@@ -580,6 +921,18 @@
         }
       }
     },
+    "Save current parameter state" : {
+
+    },
+    "Select..." : {
+
+    },
+    "Shape" : {
+
+    },
+    "Shared" : {
+
+    },
     "Show Hint" : {
       "localizations" : {
         "ja" : {
@@ -615,6 +968,9 @@
     "sk-..." : {
 
     },
+    "Snapshot" : {
+
+    },
     "Sphere" : {
       "localizations" : {
         "ja" : {
@@ -635,6 +991,9 @@
 
     },
     "Technical Barriers:" : {
+
+    },
+    "Thinking" : {
 
     },
     "Thinking..." : {
@@ -691,6 +1050,31 @@
     "Use + to add parameters, or write\n// @param _name type default ..." : {
 
     },
+    "User reference" : {
+
+    },
+    "Vertex (Distortion)" : {
+
+    },
+    "Vertex & fragment shaders on 3D meshes" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "3Dメッシュ上の頂点・フラグメントシェーダー"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "3D 网格上的顶点和片段着色器"
+          }
+        }
+      }
+    },
+    "Vertex fields for all 2D object shaders" : {
+
+    },
     "Vertex fields shared across all mesh shaders" : {
 
     },
@@ -725,6 +1109,24 @@
           }
         }
       }
+    },
+    "VS" : {
+
+    },
+    "w" : {
+
+    },
+    "W" : {
+
+    },
+    "x" : {
+
+    },
+    "y" : {
+
+    },
+    "z" : {
+
     },
     "已删除「%@」" : {
 

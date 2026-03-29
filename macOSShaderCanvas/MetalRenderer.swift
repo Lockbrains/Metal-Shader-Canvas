@@ -82,6 +82,9 @@ import simd
 private struct PPUniforms {
     var modelViewProjectionMatrix: simd_float4x4
     var time: Float
+    var mouseX: Float = 0
+    var mouseY: Float = 0
+    var _pad: Float = 0
 }
 
 // MARK: - MetalRenderer
@@ -92,6 +95,10 @@ private struct PPUniforms {
 /// Conforms to `MTKViewDelegate` to receive frame callbacks (`draw(in:)`)
 /// and resize notifications (`mtkView(_:drawableSizeWillChange:)`).
 class MetalRenderer: NSObject, MTKViewDelegate {
+
+    /// Weak shared reference for cross-component access (e.g. AI snapshot capture).
+    /// Set automatically on init; only one MetalRenderer exists at a time.
+    static weak var current: MetalRenderer?
 
     // MARK: - Core Metal Objects
 
@@ -127,8 +134,8 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     /// Elapsed time in seconds, incremented each frame. Passed to shaders as `uniforms.time`.
     var time: Float = 0
 
-    /// When true, the mesh uses an identity model matrix (no rotation).
-    var isRotationPaused: Bool = false
+    /// Y-axis rotation angle in degrees, controlled by the UI slider.
+    var rotationAngle: Float = 0
 
     /// The current shader layer configuration, mirrored from the SwiftUI state.
     var activeShaders: [ActiveShader] = []
@@ -146,6 +153,41 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     
     /// Parsed params per fullscreen shader (for buffer packing).
     private var fullscreenParams: [UUID: [ShaderParam]] = [:]
+
+    // MARK: - Mouse & Canvas Mode
+
+    /// Normalised mouse position [0,1] read from TrackingMTKView each frame.
+    var mousePosition: simd_float2 = .zero
+
+    /// 2D vs 3D canvas mode. Set from MetalView on every SwiftUI update.
+    var canvasMode: CanvasMode = .threeDimensional
+
+    /// Kept for backward-compat with single-shape documents (unused by new scene path).
+    var shape2DType: Shape2DType = .roundedRectangle
+
+    // MARK: - 2D Scene State
+
+    /// All objects in the 2D scene. Set from MetalView on SwiftUI updates.
+    var objects2D: [Object2D] = []
+    /// Scene-wide shared vertex (distortion) shader code.
+    var sharedVertexCode2D: String = ShaderSnippets.distortion2DTemplate
+    /// Scene-wide shared fragment (color) shader code.
+    var sharedFragmentCode2D: String = ShaderSnippets.fragment2DDemo
+    /// 2D Data Flow configuration controlling which fields appear in VertexOut.
+    var dataFlow2DConfig: DataFlow2DConfig = DataFlow2DConfig()
+    /// Canvas camera zoom level.
+    var canvasZoom: Float = 1.0
+    /// Canvas camera pan offset (NDC).
+    var canvasPan: simd_float2 = .zero
+
+    /// Per-object compiled pipeline (VS distort + FS color + SDF mask, single pass).
+    var object2DPipelineStates: [UUID: MTLRenderPipelineState] = [:]
+
+    /// Pipeline for the 2D grid background (compiled once).
+    var gridPipelineState: MTLRenderPipelineState?
+
+    /// Background-image blit for 2D mode (no depth attachment).
+    var bg2DBlitPipelineState: MTLRenderPipelineState?
 
     // MARK: - Offscreen Textures (Ping-Pong)
 
@@ -228,6 +270,9 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         compileMeshPipeline()
         compileBlitPipeline(metalView: metalView)
         compileBgBlitPipeline()
+        compileGridPipeline()
+
+        MetalRenderer.current = self
     }
 
     // MARK: - Mesh Setup
@@ -316,20 +361,25 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     /// - Parameters:
     ///   - shaders: The new shader array from SwiftUI state.
     ///   - view: The MTKView, needed for pixel format info during compilation.
-    func updateShaders(_ shaders: [ActiveShader], dataFlow: DataFlowConfig, paramValues: [String: [Float]], in view: MTKView) {
+    func updateShaders(_ shaders: [ActiveShader], dataFlow: DataFlowConfig, in view: MTKView) {
         let oldShaders = self.activeShaders
         let oldDataFlow = self.dataFlowConfig
         self.activeShaders = shaders
         self.dataFlowConfig = dataFlow
-        self.paramValues = paramValues
 
         let dataFlowChanged = dataFlow != oldDataFlow
         let vertexChanged = shaders.filter({ $0.category == .vertex }).map(\.code) != oldShaders.filter({ $0.category == .vertex }).map(\.code)
         let fragmentChanged = shaders.filter({ $0.category == .fragment }).map(\.code) != oldShaders.filter({ $0.category == .fragment }).map(\.code)
         let fullscreenChanged = shaders.filter({ $0.category == .fullscreen }).map({ "\($0.id)\($0.code)" }) != oldShaders.filter({ $0.category == .fullscreen }).map({ "\($0.id)\($0.code)" })
 
-        if vertexChanged || fragmentChanged || dataFlowChanged {
-            compileMeshPipeline()
+        if canvasMode.is2D {
+            if fragmentChanged || dataFlowChanged {
+                compileObject2DPipelines()
+            }
+        } else {
+            if vertexChanged || fragmentChanged || dataFlowChanged {
+                compileMeshPipeline()
+            }
         }
         if fullscreenChanged {
             compileFullscreenPipelines(metalView: view)
@@ -520,6 +570,100 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         }
     }
 
+    // MARK: - 2D Pipeline Compilation
+
+    /// Compiles the grid background pipeline (2D mode). Called once during init.
+    func compileGridPipeline() {
+        do {
+            let lib = try device.makeLibrary(source: ShaderSnippets.gridShader, options: nil)
+            let descriptor = MTLRenderPipelineDescriptor()
+            descriptor.vertexFunction = lib.makeFunction(name: "vertex_main")
+            descriptor.fragmentFunction = lib.makeFunction(name: "fragment_main")
+            descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+            self.gridPipelineState = try device.makeRenderPipelineState(descriptor: descriptor)
+        } catch {
+            print("Failed to compile grid pipeline: \(error)")
+        }
+
+        do {
+            let lib = try device.makeLibrary(source: ShaderSnippets.blitShader, options: nil)
+            let descriptor = MTLRenderPipelineDescriptor()
+            descriptor.vertexFunction = lib.makeFunction(name: "vertex_main")
+            descriptor.fragmentFunction = lib.makeFunction(name: "fragment_main")
+            descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+            Self.configureAlphaBlending(on: descriptor.colorAttachments[0])
+            self.bg2DBlitPipelineState = try device.makeRenderPipelineState(descriptor: descriptor)
+        } catch {
+            print("Failed to compile 2D bg blit pipeline: \(error)")
+        }
+    }
+
+    /// Compiles one pipeline per Object2D.
+    /// Each pipeline merges: user distort_main → system vertex_main wrapper →
+    /// user fragment_main (renamed) → SDF mask wrapper.  Single-pass alpha-blend.
+    func compileObject2DPipelines() {
+        var newStates: [UUID: MTLRenderPipelineState] = [:]
+        var hasError = false
+
+        for object in objects2D {
+            let vsUserCode = object.customVertexCode ?? sharedVertexCode2D
+            let fsUserCode = object.customFragmentCode ?? sharedFragmentCode2D
+            let shape = object.shapeType
+
+            let header = ShaderSnippets.generateSharedHeader2D(config: dataFlow2DConfig)
+
+            // Merge params from both VS and FS to support @param in distortion shaders
+            var allParams: [ShaderParam] = []
+            var seenNames = Set<String>()
+            for code in [vsUserCode, fsUserCode] {
+                for param in ShaderSnippets.parseParams(from: code) {
+                    if seenNames.insert(param.name).inserted { allParams.append(param) }
+                }
+            }
+            let paramHeader = ShaderSnippets.generateParamHeader(params: allParams)
+            let totalParamCount = allParams.count
+
+            // VS: header + params + user distort_main + system vertex_main wrapper
+            let vsStripped = ShaderSnippets.stripStructDefinitions(from: vsUserCode)
+            let vsInjected = ShaderSnippets.inject2DVertexParamsBuffer(into: vsStripped, paramCount: totalParamCount)
+            let vsWrapper = ShaderSnippets.generate2DVertexWrapper(shape: shape, config: dataFlow2DConfig, hasParams: totalParamCount > 0)
+            let vsSource = header + paramHeader + vsInjected + vsWrapper
+
+            // FS: header + params + SDF-wrapped user fragment
+            // NOTE: Do NOT call injectParamsBuffer here — wrapFragmentWithSDF
+            // handles params injection itself to guarantee correct argument order
+            // when both bgTexture and params are present.
+            let fsStripped = ShaderSnippets.stripStructDefinitions(from: fsUserCode)
+            let fsWrapped = ShaderSnippets.wrapFragmentWithSDF(userCode: fsStripped, shape: shape, hasParams: totalParamCount > 0)
+            let fsSource = header + paramHeader + fsWrapped
+
+            do {
+                let vLib = try device.makeLibrary(source: vsSource, options: nil)
+                let fLib = try device.makeLibrary(source: fsSource, options: nil)
+                guard let vFunc = vLib.makeFunction(name: "vertex_main"),
+                      let fFunc = fLib.makeFunction(name: "fragment_main") else {
+                    print("Missing entry point for 2D object \(object.name)")
+                    continue
+                }
+                let desc = MTLRenderPipelineDescriptor()
+                desc.vertexFunction = vFunc
+                desc.fragmentFunction = fFunc
+                desc.colorAttachments[0].pixelFormat = .bgra8Unorm
+                Self.configureAlphaBlending(on: desc.colorAttachments[0])
+                newStates[object.id] = try device.makeRenderPipelineState(descriptor: desc)
+            } catch {
+                hasError = true
+                let msg = Self.extractMSLErrors(from: "\(error)")
+                NotificationCenter.default.post(name: .shaderCompilationResult, object: "[\(object.name)] \(msg)")
+            }
+        }
+
+        if !hasError {
+            NotificationCenter.default.post(name: .shaderCompilationResult, object: nil)
+        }
+        object2DPipelineStates = newStates
+    }
+
     // MARK: - Background Image Loading
 
     /// Converts an NSImage into a Metal texture for GPU rendering.
@@ -618,8 +762,12 @@ class MetalRenderer: NSObject, MTKViewDelegate {
             return
         }
 
+        // Read normalised mouse position from the tracking view.
+        if let trackingView = view as? TrackingMTKView {
+            mousePosition = trackingView.normalizedMousePosition
+        }
+
         // Ensure offscreen textures match the current drawable size.
-        // This handles the case where resize events are missed.
         let size = view.drawableSize
         if offscreenTextureA == nil || offscreenTextureA!.width != Int(size.width) || offscreenTextureA!.height != Int(size.height) {
             setupOffscreenTextures(size: size)
@@ -630,89 +778,183 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         // Advance the animation clock (~60fps assumed).
         time += 1.0 / 60.0
 
-        // ─── PASS 1: Base Mesh Rendering → Texture A ─────────────────────
+        // Tracks which texture holds the base pass result (before PP chain).
+        var baseResultTex = texA
+        var basePPDest = texB
 
-        let meshPassDesc = MTLRenderPassDescriptor()
-        meshPassDesc.colorAttachments[0].texture = texA
-        meshPassDesc.colorAttachments[0].loadAction = .clear
-        meshPassDesc.colorAttachments[0].clearColor = MTLClearColor(red: 0.15, green: 0.15, blue: 0.15, alpha: 1.0)
-        meshPassDesc.colorAttachments[0].storeAction = .store
+        if canvasMode.is2D {
+            // ─── 2D PASS 1: Grid/Background → Texture A (fullscreen) ────
 
-        meshPassDesc.depthAttachment.texture = depthTex
-        meshPassDesc.depthAttachment.loadAction = .clear
-        meshPassDesc.depthAttachment.storeAction = .dontCare
-        meshPassDesc.depthAttachment.clearDepth = 1.0
+            let basePassDesc = MTLRenderPassDescriptor()
+            basePassDesc.colorAttachments[0].texture = texA
+            basePassDesc.colorAttachments[0].loadAction = .clear
+            basePassDesc.colorAttachments[0].clearColor = MTLClearColor(red: 0.118, green: 0.118, blue: 0.137, alpha: 1.0)
+            basePassDesc.colorAttachments[0].storeAction = .store
 
-        if let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: meshPassDesc) {
-            // Step 1: Draw background image (if loaded) as a fullscreen quad.
-            // This is drawn first so the mesh renders on top of it.
-            if let bgTex = backgroundTexture, let bgPipeline = bgBlitPipelineState {
-                encoder.setRenderPipelineState(bgPipeline)
-                encoder.setFragmentTexture(bgTex, index: 0)
-                encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
-            }
-
-            // Step 2: Draw the 3D mesh with the user's vertex + fragment shaders.
-            // Two-pass rendering for correct alpha blending on convex meshes:
-            //   Pass A: back faces first  (cull front) — establishes back surface colors
-            //   Pass B: front faces second (cull back)  — blends on top of back faces
-            if let pipeline = meshPipelineState, let mesh = mesh {
-                encoder.setRenderPipelineState(pipeline)
-                encoder.setDepthStencilState(depthStencilState)
-
-                let aspect = Float(size.width / size.height)
-                let projectionMatrix = matrix_perspective_right_hand(fovyRadians: Float.pi / 3.0, aspectRatio: aspect, nearZ: 0.1, farZ: 100.0)
-                let viewMatrix = matrix_translation(0, 0, -8.0)
-                let modelMatrix = isRotationPaused
-                    ? matrix_identity_float4x4
-                    : matrix_rotation(time * 0.3, axis: simd_float3(0, 1, 0))
-                let mvp = matrix_multiply(projectionMatrix, matrix_multiply(viewMatrix, modelMatrix))
-                
-                let normalMatrix = simd_transpose(simd_inverse(modelMatrix))
-                
-                let cameraPosition = simd_float4(0, 0, 8, 0)
-
-                var uniforms = Uniforms(
-                    mvpMatrix: mvp,
-                    modelMatrix: modelMatrix,
-                    normalMatrix: normalMatrix,
-                    cameraPosition: cameraPosition,
-                    time: time
+            if let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: basePassDesc) {
+                var uniforms2D = Uniforms2D(
+                    resolution: simd_float2(Float(size.width), Float(size.height)),
+                    time: time,
+                    mouseX: mousePosition.x,
+                    mouseY: mousePosition.y
                 )
-                encoder.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
-                
-                var paramBuffer = ShaderSnippets.packParamBuffer(params: meshParams, values: paramValues)
-                if !paramBuffer.isEmpty {
-                    encoder.setVertexBytes(&paramBuffer, length: paramBuffer.count * MemoryLayout<Float>.stride, index: 2)
-                    encoder.setFragmentBytes(&paramBuffer, length: paramBuffer.count * MemoryLayout<Float>.stride, index: 2)
+                var gridTransform = Transform2D(canvasPan: canvasPan, canvasZoom: canvasZoom)
+
+                if let bgTex = backgroundTexture, let bgPipeline = bg2DBlitPipelineState {
+                    encoder.setRenderPipelineState(bgPipeline)
+                    encoder.setFragmentTexture(bgTex, index: 0)
+                    encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+                } else if let gridPipeline = gridPipelineState {
+                    encoder.setRenderPipelineState(gridPipeline)
+                    encoder.setFragmentBytes(&uniforms2D, length: MemoryLayout<Uniforms2D>.stride, index: 1)
+                    encoder.setVertexBytes(&gridTransform, length: MemoryLayout<Transform2D>.stride, index: 3)
+                    encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+                }
+                encoder.endEncoding()
+            }
+
+            // ─── 2D PASS 2: Per-Object single-pass (VS+FS+SDF) → texA ──
+            // Before each object, snapshot texA → texB so the fragment shader
+            // can sample the background (grid + previous objects) via bgTexture.
+
+            for object in objects2D {
+                guard let pipeline = object2DPipelineStates[object.id] else { continue }
+
+                // Snapshot current canvas state into texB for background sampling.
+                if let blitEncoder = commandBuffer.makeBlitCommandEncoder() {
+                    blitEncoder.copy(from: texA, to: texB)
+                    blitEncoder.endEncoding()
                 }
 
-                for (index, vertexBuffer) in mesh.vertexBuffers.enumerated() {
-                    encoder.setVertexBuffer(vertexBuffer.buffer, offset: vertexBuffer.offset, index: index)
-                }
+                let passDesc = MTLRenderPassDescriptor()
+                passDesc.colorAttachments[0].texture = texA
+                passDesc.colorAttachments[0].loadAction = .load
+                passDesc.colorAttachments[0].storeAction = .store
 
-                // Pass A: draw back faces (cull front faces)
-                encoder.setCullMode(.front)
-                for submesh in mesh.submeshes {
-                    encoder.drawIndexedPrimitives(type: submesh.primitiveType, indexCount: submesh.indexCount, indexType: submesh.indexType, indexBuffer: submesh.indexBuffer.buffer, indexBufferOffset: submesh.indexBuffer.offset)
-                }
+                if let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: passDesc) {
+                    encoder.setRenderPipelineState(pipeline)
 
-                // Pass B: draw front faces on top (cull back faces)
-                encoder.setCullMode(.back)
-                for submesh in mesh.submeshes {
-                    encoder.drawIndexedPrimitives(type: submesh.primitiveType, indexCount: submesh.indexCount, indexType: submesh.indexType, indexBuffer: submesh.indexBuffer.buffer, indexBufferOffset: submesh.indexBuffer.offset)
+                    var uniforms2D = Uniforms2D(
+                        resolution: simd_float2(Float(size.width), Float(size.height)),
+                        time: time,
+                        mouseX: mousePosition.x,
+                        mouseY: mousePosition.y
+                    )
+                    encoder.setVertexBytes(&uniforms2D, length: MemoryLayout<Uniforms2D>.stride, index: 1)
+                    encoder.setFragmentBytes(&uniforms2D, length: MemoryLayout<Uniforms2D>.stride, index: 1)
+
+                    // Bind background snapshot for optional sampling in fragment shader.
+                    encoder.setFragmentTexture(texB, index: 0)
+
+                    var transform = Transform2D(
+                        objectOffset: simd_float2(object.posX, object.posY),
+                        objectScale: simd_float2(object.scaleW, object.scaleH),
+                        canvasPan: canvasPan,
+                        canvasZoom: canvasZoom,
+                        objectRotation: object.rotation,
+                        cornerRadius: object.cornerRadius
+                    )
+                    encoder.setVertexBytes(&transform, length: MemoryLayout<Transform2D>.stride, index: 3)
+
+                    let vsCode = object.customVertexCode ?? sharedVertexCode2D
+                    let fsCode = object.customFragmentCode ?? sharedFragmentCode2D
+                    var drawParams: [ShaderParam] = []
+                    var drawSeen = Set<String>()
+                    for code in [vsCode, fsCode] {
+                        for p in ShaderSnippets.parseParams(from: code) {
+                            if drawSeen.insert(p.name).inserted { drawParams.append(p) }
+                        }
+                    }
+                    if !drawParams.isEmpty {
+                        var paramBuffer = ShaderSnippets.packParamBuffer(params: drawParams, values: paramValues)
+                        let bufLen = paramBuffer.count * MemoryLayout<Float>.stride
+                        encoder.setVertexBytes(&paramBuffer, length: bufLen, index: 2)
+                        encoder.setFragmentBytes(&paramBuffer, length: bufLen, index: 2)
+                    }
+
+                    encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+                    encoder.endEncoding()
                 }
             }
-            encoder.endEncoding()
+
+            baseResultTex = texA
+            basePPDest = texB
+
+        } else {
+            // ─── 3D PASS 1: Base Mesh Rendering → Texture A ─────────────
+
+            let meshPassDesc = MTLRenderPassDescriptor()
+            meshPassDesc.colorAttachments[0].texture = texA
+            meshPassDesc.colorAttachments[0].loadAction = .clear
+            meshPassDesc.colorAttachments[0].clearColor = MTLClearColor(red: 0.15, green: 0.15, blue: 0.15, alpha: 1.0)
+            meshPassDesc.colorAttachments[0].storeAction = .store
+
+            meshPassDesc.depthAttachment.texture = depthTex
+            meshPassDesc.depthAttachment.loadAction = .clear
+            meshPassDesc.depthAttachment.storeAction = .dontCare
+            meshPassDesc.depthAttachment.clearDepth = 1.0
+
+            if let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: meshPassDesc) {
+                if let bgTex = backgroundTexture, let bgPipeline = bgBlitPipelineState {
+                    encoder.setRenderPipelineState(bgPipeline)
+                    encoder.setFragmentTexture(bgTex, index: 0)
+                    encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+                }
+
+                if let pipeline = meshPipelineState, let mesh = mesh {
+                    encoder.setRenderPipelineState(pipeline)
+                    encoder.setDepthStencilState(depthStencilState)
+
+                    let aspect = Float(size.width / size.height)
+                    let projectionMatrix = matrix_perspective_right_hand(fovyRadians: Float.pi / 3.0, aspectRatio: aspect, nearZ: 0.1, farZ: 100.0)
+                    let viewMatrix = matrix_translation(0, 0, -8.0)
+                let modelMatrix = matrix_rotation(rotationAngle * Float.pi / 180.0, axis: simd_float3(0, 1, 0))
+                    let mvp = matrix_multiply(projectionMatrix, matrix_multiply(viewMatrix, modelMatrix))
+
+                    let normalMatrix = simd_transpose(simd_inverse(modelMatrix))
+                    let cameraPosition = simd_float4(0, 0, 8, 0)
+
+                    var uniforms = Uniforms(
+                        mvpMatrix: mvp,
+                        modelMatrix: modelMatrix,
+                        normalMatrix: normalMatrix,
+                        cameraPosition: cameraPosition,
+                        time: time,
+                        mouseX: mousePosition.x,
+                        mouseY: mousePosition.y
+                    )
+                    encoder.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
+
+                    var paramBuffer = ShaderSnippets.packParamBuffer(params: meshParams, values: paramValues)
+                    if !paramBuffer.isEmpty {
+                        encoder.setVertexBytes(&paramBuffer, length: paramBuffer.count * MemoryLayout<Float>.stride, index: 2)
+                        encoder.setFragmentBytes(&paramBuffer, length: paramBuffer.count * MemoryLayout<Float>.stride, index: 2)
+                    }
+
+                    for (index, vertexBuffer) in mesh.vertexBuffers.enumerated() {
+                        encoder.setVertexBuffer(vertexBuffer.buffer, offset: vertexBuffer.offset, index: index)
+                    }
+
+                    encoder.setCullMode(.front)
+                    for submesh in mesh.submeshes {
+                        encoder.drawIndexedPrimitives(type: submesh.primitiveType, indexCount: submesh.indexCount, indexType: submesh.indexType, indexBuffer: submesh.indexBuffer.buffer, indexBufferOffset: submesh.indexBuffer.offset)
+                    }
+
+                    encoder.setCullMode(.back)
+                    for submesh in mesh.submeshes {
+                        encoder.drawIndexedPrimitives(type: submesh.primitiveType, indexCount: submesh.indexCount, indexType: submesh.indexType, indexBuffer: submesh.indexBuffer.buffer, indexBufferOffset: submesh.indexBuffer.offset)
+                    }
+                }
+                encoder.endEncoding()
+            }
         }
 
         // ─── PASS 2..N: Fullscreen Post-Processing (Ping-Pong) ──────────
 
-        // Ping-pong: alternate between two textures. After PASS 1, the scene
-        // is in texA. Each post-processing pass reads from "source" and writes
-        // to "dest", then they swap for the next pass.
-        var currentSourceTex = texA
-        var currentDestTex = texB
+        // Ping-pong: alternate between two textures. The base pass result may
+        // be in texA (3D) or texB (2D, odd number of fragment layers).
+        var currentSourceTex = baseResultTex
+        var currentDestTex = basePPDest
 
         let fullscreenShaders = activeShaders.filter { $0.category == .fullscreen }
 
@@ -730,7 +972,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
                 // Bind the previous pass output as a texture for the fragment shader.
                 encoder.setFragmentTexture(currentSourceTex, index: 0)
 
-                var ppUniforms = PPUniforms(modelViewProjectionMatrix: matrix_identity_float4x4, time: time)
+                var ppUniforms = PPUniforms(modelViewProjectionMatrix: matrix_identity_float4x4, time: time, mouseX: mousePosition.x, mouseY: mousePosition.y)
                 encoder.setVertexBytes(&ppUniforms, length: MemoryLayout<PPUniforms>.stride, index: 1)
                 encoder.setFragmentBytes(&ppUniforms, length: MemoryLayout<PPUniforms>.stride, index: 1)
                 
@@ -821,5 +1063,75 @@ class MetalRenderer: NSObject, MTKViewDelegate {
             simd_float4(x*z*mc - y*s,   y*z*mc + x*s,   c + z*z*mc,   0),
             simd_float4(0,              0,              0,            1)
         ))
+    }
+
+    // MARK: - Snapshot Capture
+
+    /// Captures a compressed JPEG snapshot for the AI Agent's multimodal context.
+    ///
+    /// Downscales to at most 512x512 to keep token cost reasonable (~85 tokens for
+    /// a low-detail JPEG). Returns base64-encoded JPEG data, or nil on failure.
+    func captureForAI(maxDimension: Int = 512) -> Data? {
+        guard let nsImage = captureSnapshot() else { return nil }
+        let origW = nsImage.size.width
+        let origH = nsImage.size.height
+        guard origW > 0, origH > 0 else { return nil }
+
+        let scale = min(1.0, min(CGFloat(maxDimension) / origW, CGFloat(maxDimension) / origH))
+        let newW = Int(origW * scale)
+        let newH = Int(origH * scale)
+
+        let resized = NSImage(size: NSSize(width: newW, height: newH))
+        resized.lockFocus()
+        NSGraphicsContext.current?.imageInterpolation = .high
+        nsImage.draw(in: NSRect(x: 0, y: 0, width: newW, height: newH))
+        resized.unlockFocus()
+
+        guard let tiff = resized.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiff),
+              let jpeg = bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.6])
+        else { return nil }
+        return jpeg
+    }
+
+    /// Captures the current offscreen texture A as an NSImage (for Hub thumbnails).
+    func captureSnapshot() -> NSImage? {
+        guard let texture = offscreenTextureA else { return nil }
+        let w = texture.width
+        let h = texture.height
+        guard w > 0, h > 0 else { return nil }
+
+        let bytesPerRow = w * 4
+        let region = MTLRegion(origin: .init(x: 0, y: 0, z: 0),
+                               size: .init(width: w, height: h, depth: 1))
+
+        // Need a managed/shared copy to read from CPU. Private textures
+        // require a blit to a readable texture first.
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm, width: w, height: h, mipmapped: false)
+        desc.storageMode = .managed
+        desc.usage = .shaderRead
+        guard let readable = device.makeTexture(descriptor: desc),
+              let cmdBuf = commandQueue.makeCommandBuffer(),
+              let blit = cmdBuf.makeBlitCommandEncoder() else { return nil }
+        blit.copy(from: texture, to: readable)
+        blit.synchronize(resource: readable)
+        blit.endEncoding()
+        cmdBuf.commit()
+        cmdBuf.waitUntilCompleted()
+
+        var bytes = [UInt8](repeating: 0, count: bytesPerRow * h)
+        readable.getBytes(&bytes, bytesPerRow: bytesPerRow, from: region, mipmapLevel: 0)
+
+        guard let provider = CGDataProvider(data: Data(bytes) as CFData),
+              let cgImage = CGImage(width: w, height: h, bitsPerComponent: 8,
+                                    bitsPerPixel: 32, bytesPerRow: bytesPerRow,
+                                    space: CGColorSpaceCreateDeviceRGB(),
+                                    bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue),
+                                    provider: provider, decode: nil, shouldInterpolate: false,
+                                    intent: .defaultIntent)
+        else { return nil }
+
+        return NSImage(cgImage: cgImage, size: NSSize(width: w, height: h))
     }
 }

@@ -67,8 +67,8 @@ struct ShaderSnippets {
             float4x4 normalMatrix;
             float4   cameraPosition;
             float    time;
-            float    _pad0;
-            float    _pad1;
+            float    mouseX;
+            float    mouseY;
             float    _pad2;
         };
 
@@ -203,10 +203,29 @@ struct ShaderSnippets {
         preview += "\n    float4x4 modelMatrix;"
         preview += "\n    float4x4 normalMatrix;"
         preview += "\n    float4   cameraPosition;"
-        preview += "\n    float    time;\n};"
+        preview += "\n    float    time;"
+        preview += "\n    float    mouseX;"
+        preview += "\n    float    mouseY;\n};"
         return preview
     }
     
+    /// Generates a clean struct-only preview for the 2D Data Flow panel.
+    static func generateStructPreview2D(config: DataFlow2DConfig) -> String {
+        var preview = "struct VertexOut {\n    float4 position [[position]];"
+        preview += "\n    float2 texCoord;"
+        preview += "\n    float  shapeAspect;"
+        preview += "\n    float  cornerRadius;"
+        if config.timeEnabled           { preview += "\n    float  time;" }
+        if config.mouseEnabled           { preview += "\n    float2 mouse;" }
+        if config.objectPositionEnabled  { preview += "\n    float2 objectPosition;" }
+        if config.screenUVEnabled        { preview += "\n    float2 screenUV;" }
+        preview += "\n};\n\nstruct Uniforms {\n    float2 resolution;"
+        preview += "\n    float  time;"
+        preview += "\n    float  mouseX;"
+        preview += "\n    float  mouseY;\n};"
+        return preview
+    }
+
     // MARK: - User Parameter System (@param)
     
     /// Parses `// @param` directives from shader source code.
@@ -309,6 +328,22 @@ struct ShaderSnippets {
         return result
     }
     
+    /// Injects `constant float *params` into the 2D distort_main function signature.
+    /// Unlike fragment shaders which use [[buffer(2)]], distort_main is a regular function
+    /// called by the system vertex_main, so we just add a plain parameter.
+    static func inject2DVertexParamsBuffer(into code: String, paramCount: Int) -> String {
+        guard paramCount > 0 else { return code }
+        let pattern = #"(distort_main\s*\([\s\S]*?)(Uniforms\s+uniforms)\s*\)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return code }
+        let nsCode = code as NSString
+        guard let match = regex.firstMatch(in: code, range: NSRange(location: 0, length: nsCode.length)) else { return code }
+        if nsCode.substring(with: match.range).contains("params") { return code }
+        let replacement = nsCode.substring(with: match.range(at: 1)) +
+                          nsCode.substring(with: match.range(at: 2)) +
+                          ", constant float *params)"
+        return nsCode.replacingCharacters(in: match.range, with: replacement)
+    }
+
     /// Packs current parameter values into a flat float array for GPU upload.
     static func packParamBuffer(params: [ShaderParam], values: [String: [Float]]) -> [Float] {
         var buffer: [Float] = []
@@ -426,6 +461,9 @@ struct ShaderSnippets {
     struct Uniforms {
         float4x4 modelViewProjectionMatrix;
         float time;
+        float mouseX;
+        float mouseY;
+        float _pad;
     };
 
     vertex VertexOut vertex_main(uint vertexID [[vertex_id]], constant Uniforms &uniforms [[buffer(1)]]) {
@@ -763,6 +801,9 @@ struct ShaderSnippets {
     struct Uniforms {
         float4x4 modelViewProjectionMatrix;
         float time;
+        float mouseX;
+        float mouseY;
+        float _pad;
     };
 
     // --- Fullscreen Triangle Vertex Shader ---
@@ -846,6 +887,9 @@ struct ShaderSnippets {
     struct Uniforms {
         float4x4 modelViewProjectionMatrix;
         float time;
+        float mouseX;
+        float mouseY;
+        float _pad;
     };
 
     vertex VertexOut vertex_main(uint vertexID [[vertex_id]],
@@ -913,6 +957,9 @@ struct ShaderSnippets {
     struct Uniforms {
         float4x4 modelViewProjectionMatrix;
         float time;
+        float mouseX;
+        float mouseY;
+        float _pad;
     };
 
     vertex VertexOut vertex_main(uint vertexID [[vertex_id]],
@@ -971,6 +1018,9 @@ struct ShaderSnippets {
     struct Uniforms {
         float4x4 modelViewProjectionMatrix;
         float time;
+        float mouseX;
+        float mouseY;
+        float _pad;
     };
 
     vertex VertexOut vertex_main(uint vertexID [[vertex_id]],
@@ -1033,6 +1083,9 @@ struct ShaderSnippets {
     struct Uniforms {
         float4x4 modelViewProjectionMatrix;
         float time;
+        float mouseX;
+        float mouseY;
+        float _pad;
     };
 
     vertex VertexOut vertex_main(uint vertexID [[vertex_id]],
@@ -1090,6 +1143,9 @@ struct ShaderSnippets {
     struct Uniforms {
         float4x4 modelViewProjectionMatrix;
         float time;
+        float mouseX;
+        float mouseY;
+        float _pad;
     };
 
     vertex VertexOut vertex_main(uint vertexID [[vertex_id]],
@@ -1133,6 +1189,385 @@ struct ShaderSnippets {
         float3 result = mix(baseColor.rgb, _edgeColor, edge * _edgeStrength);
 
         return float4(result, 1.0);
+    }
+    """
+
+    // MARK: - 2D Canvas Mode
+
+    /// MSL header for 2D canvas shaders.
+    /// Generates VertexOut dynamically based on DataFlow2DConfig, plus fixed
+    /// Uniforms and Transform2D structs.
+    static func generateSharedHeader2D(config: DataFlow2DConfig = DataFlow2DConfig()) -> String {
+        var header = """
+        #include <metal_stdlib>
+        using namespace metal;
+
+        struct VertexOut {
+            float4 position [[position]];
+            float2 texCoord;
+            float  shapeAspect;
+            float  cornerRadius;
+        """
+        if config.timeEnabled           { header += "\n    float  time;" }
+        if config.mouseEnabled           { header += "\n    float2 mouse;" }
+        if config.objectPositionEnabled  { header += "\n    float2 objectPosition;" }
+        if config.screenUVEnabled        { header += "\n    float2 screenUV;" }
+        header += """
+
+        };
+
+        struct Uniforms {
+            float2 resolution;
+            float  time;
+            float  mouseX;
+            float  mouseY;
+            float  _pad;
+        };
+
+        struct Transform2D {
+            float2 objectOffset;
+            float2 objectScale;
+            float2 canvasPan;
+            float  canvasZoom;
+            float  objectRotation;
+            float  cornerRadius;
+        };
+
+        """
+        return header
+    }
+
+    /// Grid background shader for 2D canvas mode (Unity-style graph view grid).
+    static let gridShader = """
+    #include <metal_stdlib>
+    using namespace metal;
+
+    struct VertexOut {
+        float4 position [[position]];
+        float2 texCoord;
+    };
+
+    struct Uniforms {
+        float2 resolution;
+        float  time;
+        float  mouseX;
+        float  mouseY;
+        float  _pad;
+    };
+
+    struct Transform2D {
+        float2 objectOffset;
+        float2 objectScale;
+        float2 canvasPan;
+        float  canvasZoom;
+        float  objectRotation;
+        float  cornerRadius;
+    };
+
+    vertex VertexOut vertex_main(uint vertexID [[vertex_id]],
+                                 constant Transform2D &transform [[buffer(3)]]) {
+        VertexOut out;
+        float2 positions[3] = {
+            float2(-1.0, -1.0),
+            float2( 3.0, -1.0),
+            float2(-1.0,  3.0)
+        };
+        out.position = float4(positions[vertexID], 0.0, 1.0);
+        float2 uv = positions[vertexID] * 0.5 + 0.5;
+        uv.y = 1.0 - uv.y;
+        // Apply inverse camera so the grid scrolls with pan/zoom
+        uv = (uv - 0.5) / transform.canvasZoom + 0.5 + transform.canvasPan * 0.5;
+        out.texCoord = uv;
+        return out;
+    }
+
+    fragment float4 fragment_main(VertexOut in [[stage_in]],
+                                  constant Uniforms &uniforms [[buffer(1)]]) {
+        float2 uv = in.texCoord;
+        float aspect = uniforms.resolution.x / uniforms.resolution.y;
+        float2 coord = float2(uv.x * aspect, uv.y) * 50.0;
+
+        float2 grid = abs(fract(coord - 0.5) - 0.5) / fwidth(coord);
+        float minorLine = min(grid.x, grid.y);
+
+        float2 majorCoord = coord / 5.0;
+        float2 majorGrid = abs(fract(majorCoord - 0.5) - 0.5) / fwidth(majorCoord);
+        float majorLine = min(majorGrid.x, majorGrid.y);
+
+        float3 bg = float3(0.118, 0.118, 0.137);
+        float3 minorColor = float3(0.196, 0.196, 0.220);
+        float3 majorColor = float3(0.275, 0.275, 0.314);
+
+        float3 color = bg;
+        color = mix(minorColor, color, clamp(minorLine, 0.0, 1.0));
+        color = mix(majorColor, color, clamp(majorLine, 0.0, 1.0));
+        return float4(color, 1.0);
+    }
+    """
+
+    /// Returns the SDF function body for a given 2D shape.
+    /// All SDFs operate in aspect-corrected space so that curved features
+    /// (rounded corners, circles) remain circular on screen regardless of
+    /// the quad's width/height ratio or per-object scaleW/scaleH.
+    /// The `aspect` parameter is the runtime screen-space aspect ratio.
+    static func sdfFunction(for shape: Shape2DType) -> String {
+        switch shape {
+        case .rectangle:
+            return """
+                float2 q = (uv - 0.5) * float2(aspect, 1.0);
+                float2 d = abs(q) - float2(aspect * 0.5, 0.5);
+                return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
+            """
+        case .roundedRectangle:
+            return """
+                float2 q = (uv - 0.5) * float2(aspect, 1.0);
+                float2 hs = float2(aspect * 0.5, 0.5);
+                float r = clamp(cornerR, 0.001, min(hs.x, hs.y));
+                float2 d = abs(q) - (hs - r);
+                float2 c = max(d, 0.0) / r;
+                float2 c2 = c * c;
+                float2 c4 = c2 * c2;
+                float lp = sqrt(sqrt(c4.x + c4.y));
+                return (lp - 1.0) * r + min(max(d.x, d.y), 0.0);
+            """
+        case .circle:
+            return """
+                float2 q = (uv - 0.5) * float2(aspect, 1.0);
+                float minHalf = min(aspect * 0.5, 0.5);
+                return length(q) - minHalf;
+            """
+        case .capsule:
+            return """
+                float2 p = uv - 0.5;
+                float2 q = float2(p.x * aspect, p.y);
+                float halfLen = max(0.0, aspect * 0.5 - 0.5);
+                q.x = max(abs(q.x) - halfLen, 0.0);
+                return length(q) - 0.5;
+            """
+        }
+    }
+
+    /// Generates the system vertex_main that calls the user's `distort_main`
+    /// and then applies object transform + canvas camera.
+    /// Populates Data Flow fields based on the 2D config.
+    static func generate2DVertexWrapper(shape: Shape2DType, config: DataFlow2DConfig = DataFlow2DConfig(), hasParams: Bool = false) -> String {
+        let sa = shape.quadAspect
+        let paramsArg = hasParams ? ",\n                                     constant float *params [[buffer(2)]]" : ""
+        let paramsForward = hasParams ? ", params" : ""
+        var fn = """
+        vertex VertexOut vertex_main(uint vertexID [[vertex_id]],
+                                     constant Uniforms &uniforms [[buffer(1)]]\(paramsArg),
+                                     constant Transform2D &transform [[buffer(3)]]) {
+            float halfW = 0.5 * \(sa);
+            float2 localPositions[6] = {
+                float2(-halfW, -0.5), float2( halfW, -0.5), float2(-halfW,  0.5),
+                float2(-halfW,  0.5), float2( halfW, -0.5), float2( halfW,  0.5)
+            };
+            float2 uvs[6] = {
+                float2(0.0, 1.0), float2(1.0, 1.0), float2(0.0, 0.0),
+                float2(0.0, 0.0), float2(1.0, 1.0), float2(1.0, 0.0)
+            };
+
+            float2 localPos = localPositions[vertexID];
+            float2 uv = uvs[vertexID];
+
+            float2 distorted = distort_main(localPos, uv, uniforms\(paramsForward));
+
+            float2 pos = distorted * transform.objectScale;
+
+            float viewAspect = uniforms.resolution.x / uniforms.resolution.y;
+            pos.x *= viewAspect;
+            float c = cos(transform.objectRotation);
+            float s = sin(transform.objectRotation);
+            pos = float2(pos.x * c - pos.y * s, pos.x * s + pos.y * c);
+            pos.x /= viewAspect;
+
+            pos += transform.objectOffset;
+
+            pos = (pos - transform.canvasPan) * transform.canvasZoom;
+
+            VertexOut out;
+            out.position = float4(pos, 0.0, 1.0);
+            out.texCoord = uv;
+            out.shapeAspect = \(sa) * transform.objectScale.x / transform.objectScale.y
+                             * viewAspect;
+            out.cornerRadius = transform.cornerRadius;
+        """
+        if config.timeEnabled {
+            fn += "\n        out.time = uniforms.time;"
+        }
+        if config.mouseEnabled {
+            fn += "\n        out.mouse = float2(uniforms.mouseX, uniforms.mouseY);"
+        }
+        if config.objectPositionEnabled {
+            fn += "\n        out.objectPosition = transform.objectOffset;"
+        }
+        if config.screenUVEnabled {
+            fn += "\n        out.screenUV = pos * 0.5 + 0.5;"
+            fn += "\n        out.screenUV.y = 1.0 - out.screenUV.y;"
+        }
+        fn += "\n        return out;\n    }\n"
+        return fn
+    }
+
+    /// Wraps the user's fragment_main with SDF shape masking.
+    /// The user's function is renamed to `_user_fragment` (a regular function)
+    /// and a new entry-point `fragment_main` calls it, then applies the SDF alpha mask.
+    ///
+    /// If the user's code references `bgTexture`, the background texture is passed
+    /// through to `_user_fragment` so it can sample the canvas behind the object.
+    static func wrapFragmentWithSDF(userCode: String, shape: Shape2DType, hasParams: Bool) -> String {
+        let usesBgTexture = userCode.contains("bgTexture")
+
+        var code = userCode
+        if let regex = try? NSRegularExpression(
+            pattern: #"fragment\s+(float4|half4)\s+fragment_main\s*\("#,
+            options: []
+        ) {
+            let range = NSRange(code.startIndex..., in: code)
+            code = regex.stringByReplacingMatches(in: code, range: range,
+                                                   withTemplate: "$1 _user_fragment(")
+        }
+        code = code
+            .replacingOccurrences(of: "[[stage_in]]", with: "")
+            .replacingOccurrences(of: "[[buffer(1)]]", with: "")
+            .replacingOccurrences(of: "[[buffer(2)]]", with: "")
+            .replacingOccurrences(of: "[[texture(0)]]", with: "")
+
+        // Inject params as the LAST parameter of _user_fragment so the call
+        // argument order is always: (in, uniforms, [bgTexture], params).
+        // This avoids a type-mismatch when the AI's code declares bgTexture
+        // before the injected params buffer.
+        if hasParams,
+           let funcRegex = try? NSRegularExpression(pattern: #"(_user_fragment\s*\([^)]*)"#) {
+            let nsCode = code as NSString
+            if let match = funcRegex.firstMatch(in: code, range: NSRange(location: 0, length: nsCode.length)) {
+                let captured = nsCode.substring(with: match.range(at: 1))
+                if !captured.contains("params") {
+                    code = nsCode.replacingCharacters(
+                        in: match.range(at: 1),
+                        with: captured + ", constant float *params"
+                    )
+                }
+            }
+        }
+
+        let sdfBody = sdfFunction(for: shape)
+        code += """
+
+        float _sdf_shape(float2 uv, float aspect, float cornerR) {
+            \(sdfBody)
+        }
+
+        """
+
+        // Build the wrapper's parameter list and the call arguments.
+        // bgTexture is always declared (since the renderer always binds it),
+        // but only forwarded to _user_fragment if the user's code references it.
+        // Call order MUST match _user_fragment's declaration:
+        //   (in, uniforms, [bgTexture], [params])
+        var wrapperParams = "VertexOut in [[stage_in]], constant Uniforms &uniforms [[buffer(1)]]"
+        var callArgs = "in, uniforms"
+        if usesBgTexture {
+            callArgs += ", bgTexture"
+        }
+        if hasParams {
+            wrapperParams += ", constant float *params [[buffer(2)]]"
+            callArgs += ", params"
+        }
+        wrapperParams += ", texture2d<float> bgTexture [[texture(0)]]"
+
+        code += """
+            fragment float4 fragment_main(\(wrapperParams)) {
+                float4 col = _user_fragment(\(callArgs));
+                float d = _sdf_shape(in.texCoord, in.shapeAspect, in.cornerRadius);
+                float aa = fwidth(d);
+                col.a *= 1.0 - smoothstep(0.0, aa, d);
+                return col;
+            }
+            """
+        return code
+    }
+
+    // MARK: 2D Shader Templates
+
+    /// Demo 2D distortion (vertex) shader — gentle wave effect.
+    static let distortion2DDemo = """
+    // 2D DISTORTION (VERTEX) SHADER
+    // position: shape-local coords, uv: [0,1], return distorted position.
+    float2 distort_main(float2 position, float2 uv, Uniforms uniforms) {
+        position.x += sin(uv.y * 18.0 + uniforms.time * 3.0) * 0.015;
+        position.y += cos(uv.x * 14.0 + uniforms.time * 2.0) * 0.010;
+        return position;
+    }
+    """
+
+    /// Identity distortion template — no-op, with documentation.
+    static let distortion2DTemplate = """
+    // ============================================================
+    // 2D DISTORTION (VERTEX) SHADER
+    // ============================================================
+    // Receives each vertex in shape-local space and returns a new position.
+    // The system then applies object transform + canvas camera.
+    //
+    //   position — vertex coord (shape-local, ~[-0.5, 0.5])
+    //   uv       — texture coordinate [0,1]
+    //   uniforms — .time, .resolution, .mouseX/Y
+    // ============================================================
+    float2 distort_main(float2 position, float2 uv, Uniforms uniforms) {
+        return position;
+    }
+    """
+
+    /// Demo 2D fragment shader — UI-style animated gradient button.
+    static let fragment2DDemo = """
+    fragment float4 fragment_main(VertexOut in [[stage_in]],
+                                  constant Uniforms &uniforms [[buffer(1)]]) {
+        float2 uv = in.texCoord;
+        float t = uniforms.time;
+
+        float3 topCol    = float3(0.25, 0.55, 1.0);
+        float3 bottomCol = float3(0.10, 0.30, 0.75);
+        float3 col = mix(bottomCol, topCol, uv.y);
+
+        float wave = sin(uv.x * 12.0 - t * 3.0) * 0.5 + 0.5;
+        col += wave * 0.08;
+
+        float2 p = uv - 0.5;
+        float edgeDist = max(abs(p.x), abs(p.y));
+        float innerGlow = smoothstep(0.48, 0.42, edgeDist);
+        col = mix(col + 0.15, col, innerGlow);
+
+        float specular = smoothstep(0.85, 1.0, uv.y) * 0.25;
+        col += specular;
+
+        return float4(col, 1.0);
+    }
+    """
+
+    /// Educational 2D fragment shader template.
+    static let fragment2DTemplate = """
+    // ============================================================
+    // 2D SHAPE FRAGMENT SHADER (Color Effect)
+    // ============================================================
+    // Defines the shape's surface colour. SDF edge clipping is automatic.
+    //
+    //   in.texCoord          — shape-local UV [0,1]
+    //   uniforms.resolution  — viewport size (float2)
+    //   uniforms.time        — elapsed seconds
+    //   uniforms.mouseX/Y    — cursor [0,1] (screen-space)
+    //
+    // BACKGROUND SAMPLING (optional):
+    //   Add "texture2d<float> bgTexture [[texture(0)]]" as a parameter
+    //   to sample the canvas behind this object (grid + previous objects).
+    //   Use screen-space UVs for correct sampling:
+    //     float2 screenUV = float2(in.position.xy) / uniforms.resolution;
+    //     float4 bg = bgTexture.sample(sampler(filter::linear), screenUV);
+    // ============================================================
+    fragment float4 fragment_main(VertexOut in [[stage_in]],
+                                  constant Uniforms &uniforms [[buffer(1)]]) {
+        float2 uv = in.texCoord;
+        return float4(uv, 0.5 + 0.5 * sin(uniforms.time), 1.0);
     }
     """
 }

@@ -144,8 +144,11 @@ struct ChatMessage: Identifiable {
     let timestamp = Date()
     var executedActions: [AgentAction]? = nil
     var barriers: [String]? = nil
+    var thinking: String? = nil
+    var plan: AgentPlan? = nil
+    var renderSnapshot: Data? = nil
+    var userImage: Data? = nil
 
-    /// The participant role for this message.
     enum MessageRole: String { case user, assistant, system }
 }
 

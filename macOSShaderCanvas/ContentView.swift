@@ -28,20 +28,51 @@
 
 import SwiftUI
 import UniformTypeIdentifiers
+import simd
 
 // MARK: - ContentView
 
 /// The root view of the application. Manages all UI panels and app state.
 struct ContentView: View {
 
+    // MARK: - Navigation (Hub ↔ Editor)
+
+    var appState: AppState
+    var recentManager: RecentProjectManager
+
     // MARK: - Shader State
 
     /// All active shader layers, ordered by category (vertex → fragment → fullscreen).
-    /// This array is the single source of truth for what the Metal renderer should compile.
     @State private var activeShaders: [ActiveShader] = []
 
     /// The ID of the shader currently being edited. nil = editor panel closed.
     @State private var editingShaderID: UUID? = nil
+
+    // MARK: - Canvas Mode
+
+    @State private var canvasMode: CanvasMode = .threeDimensional
+
+    /// The active 2D shape type. Kept for backward compat with legacy single-shape files.
+    @State private var shape2DType: Shape2DType = .roundedRectangle
+
+    // MARK: - 2D Scene State
+
+    @State private var objects2D: [Object2D] = []
+    @State private var sharedVertexCode2D: String = ShaderSnippets.distortion2DTemplate
+    @State private var sharedFragmentCode2D: String = ShaderSnippets.fragment2DDemo
+    @State private var selectedObjectID: UUID? = nil
+    @State private var canvasZoom: Float = 1.0
+    @State private var canvasPan: simd_float2 = .zero
+
+    /// Editing mode for 2D shader editor (which shared / per-object shader is open).
+    @State private var editing2DShaderTarget: Edit2DShaderTarget? = nil
+
+    enum Edit2DShaderTarget: Equatable {
+        case sharedVertex
+        case sharedFragment
+        case objectVertex(UUID)
+        case objectFragment(UUID)
+    }
 
     // MARK: - Mesh & Background State
 
@@ -51,7 +82,7 @@ struct ContentView: View {
     /// Display name for a custom-uploaded mesh file (for the tooltip).
     @State private var customFileName: String? = nil
 
-    /// Optional background image rendered behind the 3D mesh.
+    /// Optional background image rendered behind the 3D mesh (or 2D canvas).
     @State private var backgroundImage: NSImage? = nil
 
     // MARK: - File Importer State
@@ -59,7 +90,6 @@ struct ContentView: View {
     @State private var fileImporterPresented = false
     @State private var fileImporterMode: FileImporterMode = .mesh
 
-    /// Determines whether the file importer dialog loads a mesh or a background image.
     enum FileImporterMode {
         case mesh, background
     }
@@ -68,18 +98,28 @@ struct ContentView: View {
 
     @State private var isSidebarVisible = true
 
-    /// When true, the mesh stops rotating and resets to its rest orientation.
-    @State private var isRotationPaused = false
+    // MARK: - Panel Collapse State
+
+    @State private var isShadersCollapsed = false
+    @State private var isObjectsCollapsed = false
+    @State private var isPostProcessingCollapsed = false
+    @State private var isDataFlowCollapsed = false
+    @State private var isParametersCollapsed = false
+    @State private var isLayersCollapsed = false
+
+    private let panelWidth: CGFloat = 240
+
+    /// Y-axis rotation angle in degrees, controlled by slider in the toolbar.
+    @State private var rotationAngle: Double = 0
 
     // MARK: - Canvas File State
 
-    /// The display name of the current workspace (shown in the top-left header).
     @State private var canvasName: String = String(localized: "Untitled Canvas")
-
-    /// The file URL of the last saved/opened .shadercanvas file. nil = never saved.
     @State private var currentFileURL: URL? = nil
 
     @State private var showingNewCanvasConfirm = false
+    @State private var showingBackToHubConfirm = false
+    @State private var hasUnsavedChanges = false
     @State private var isRenamingCanvas = false
     @State private var editedCanvasName = ""
 
@@ -102,8 +142,10 @@ struct ContentView: View {
 
     // MARK: - Data Flow State
     
-    /// Configurable vertex data fields shared across all mesh shaders.
+    /// Configurable vertex data fields shared across all mesh shaders (3D).
     @State private var dataFlowConfig = DataFlowConfig()
+    /// Configurable vertex data fields for 2D canvas shaders.
+    @State private var dataFlow2DConfig = DataFlow2DConfig()
     
     // MARK: - User Parameter State
     
@@ -132,7 +174,7 @@ struct ContentView: View {
     var body: some View {
         ZStack {
             // Layer 0: Metal rendering viewport (fills the entire window).
-            MetalView(activeShaders: activeShaders, meshType: meshType, backgroundImage: backgroundImage, dataFlowConfig: dataFlowConfig, paramValues: paramValues, isRotationPaused: isRotationPaused)
+            MetalView(activeShaders: activeShaders, meshType: meshType, backgroundImage: backgroundImage, dataFlowConfig: dataFlowConfig, dataFlow2DConfig: dataFlow2DConfig, paramValues: paramValues, rotationAngle: Float(rotationAngle), canvasMode: canvasMode, objects2D: objects2D, sharedVertexCode2D: sharedVertexCode2D, sharedFragmentCode2D: sharedFragmentCode2D, canvasZoom: canvasZoom, canvasPan: canvasPan, shape2DType: shape2DType)
                 .ignoresSafeArea()
 
             // Layer 1: UI overlay (sidebar, buttons, canvas name).
@@ -191,51 +233,57 @@ struct ContentView: View {
 
                         // Collapsible layer sidebar.
                         if isSidebarVisible {
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("Layers")
-                                    .font(.headline)
-                                    .foregroundColor(.white)
-                                    .padding(.bottom, 4)
+                            if canvasMode.is2D {
+                                sidebar2DContent
+                            } else {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    collapsibleHeader("Layers", isCollapsed: $isLayersCollapsed)
 
-                                if activeShaders.isEmpty {
-                                    Text("No Active Shaders")
-                                        .font(.subheadline)
-                                        .foregroundColor(.white.opacity(0.6))
-                                } else {
-                                    ForEach(activeShaders) { shader in
-                                        HStack {
-                                            Image(systemName: shader.category.icon)
-                                                .foregroundColor(.blue)
-                                            Text(verbatim: shader.name)
-                                                .foregroundColor(.white)
-                                            Spacer()
-                                            Button(action: {
-                                                withAnimation { editingShaderID = shader.id }
-                                            }) {
-                                                Image(systemName: "pencil.circle")
-                                            }
-                                            .buttonStyle(.plain)
-                                            .foregroundColor(.white.opacity(0.7))
+                                    if !isLayersCollapsed {
+                                        if activeShaders.isEmpty {
+                                            Text("No Active Shaders")
+                                                .font(.subheadline)
+                                                .foregroundColor(.white.opacity(0.6))
+                                        } else {
+                                            ForEach(activeShaders) { shader in
+                                                HStack {
+                                                    Image(systemName: shader.category.icon)
+                                                        .foregroundColor(.blue)
+                                                    Text(verbatim: shader.name)
+                                                        .foregroundColor(.white)
+                                                    Spacer()
+                                                    Button(action: {
+                                                        withAnimation { editingShaderID = shader.id }
+                                                    }) {
+                                                        Image(systemName: "pencil.circle")
+                                                    }
+                                                    .buttonStyle(.plain)
+                                                    .foregroundColor(.white.opacity(0.7))
 
-                                            Button(action: { removeShader(shader) }) {
-                                                Image(systemName: "xmark.circle.fill")
+                                                    Button(action: { removeShader(shader) }) {
+                                                        Image(systemName: "xmark.circle.fill")
+                                                    }
+                                                    .buttonStyle(.plain)
+                                                    .foregroundColor(.red.opacity(0.8))
+                                                }
+                                                .padding(8)
+                                                .background(Color.black.opacity(0.4))
+                                                .cornerRadius(6)
                                             }
-                                            .buttonStyle(.plain)
-                                            .foregroundColor(.red.opacity(0.8))
                                         }
-                                        .padding(8)
-                                        .background(Color.black.opacity(0.4))
-                                        .cornerRadius(6)
                                     }
                                 }
+                                .frame(width: panelWidth)
+                                .padding(12)
+                                .glassEffect(.regular.tint(Color(white: 0.15)), in: .rect(cornerRadius: 12))
+                                .transition(.move(edge: .leading).combined(with: .opacity))
                             }
-                            .frame(width: 220)
-                            .padding(12)
-                            .background(Color.black.opacity(0.6))
-                            .cornerRadius(12)
-                            .transition(.move(edge: .leading).combined(with: .opacity))
                             
-                            dataFlowPanel
+                            if canvasMode.is3D {
+                                dataFlowPanel
+                            } else {
+                                dataFlow2DPanel
+                            }
                             parametersPanel
                         }
                     }
@@ -243,21 +291,22 @@ struct ContentView: View {
 
                     Spacer()
 
-                    // AI chat toggle button (top-right corner).
                     VStack {
-                        Button(action: {
-                            withAnimation(.easeInOut(duration: 0.3)) { isAIChatActive.toggle() }
-                        }) {
-                            Image(systemName: isAIChatActive ? "sparkle" : "sparkles")
-                                .font(.title2)
-                                .foregroundColor(isAIChatActive ? .purple : .white)
-                                .padding(8)
-                                .background(isAIChatActive ? Color.purple.opacity(0.3) : Color.black.opacity(0.4))
-                                .cornerRadius(8)
+                        if !isAIChatActive {
+                            Button(action: {
+                                withAnimation(.easeInOut(duration: 0.3)) { isAIChatActive.toggle() }
+                            }) {
+                                Image(systemName: "sparkles")
+                                    .font(.title2)
+                                    .foregroundColor(.white)
+                                    .padding(8)
+                                    .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 8))
+                            }
+                            .buttonStyle(.plain)
+                            .help("AI Chat (⌘L)")
+                            .padding()
+                            .transition(.opacity)
                         }
-                        .buttonStyle(.plain)
-                        .help("AI Chat (⌘L)")
-                        .padding()
                         Spacer()
                     }
                 }
@@ -266,34 +315,37 @@ struct ContentView: View {
 
                 // Bottom toolbar: shader type buttons (left) + mesh/background controls (right).
                 HStack(alignment: .bottom) {
-                    // Shader layer creation buttons.
+                    // Shader layer creation buttons (mode-aware).
                     HStack(spacing: 12) {
                         Image(systemName: "plus")
                             .font(.headline)
                             .foregroundColor(.white)
                             .padding(.trailing, 4)
 
-                        Button(action: { addShader(category: .vertex, name: String(localized: "Vertex Layer")) }) {
-                            Text(verbatim: "VS").fontWeight(.bold).padding(.horizontal, 12).padding(.vertical, 8)
-                        }
-                        .buttonStyle(.plain).background(Color.blue.opacity(0.8)).cornerRadius(8).foregroundColor(.white).help("Vertex Shader")
+                        if canvasMode.is3D {
+                            Button(action: { addShader(category: .vertex, name: String(localized: "Vertex Layer")) }) {
+                                Text(verbatim: "VS").fontWeight(.bold).padding(.horizontal, 12).padding(.vertical, 8)
+                            }
+                            .buttonStyle(.plain).foregroundColor(.white).glassEffect(.regular.tint(.blue).interactive(), in: .rect(cornerRadius: 8)).help("Vertex Shader")
 
-                        Button(action: { addShader(category: .fragment, name: String(localized: "Fragment Layer")) }) {
-                            Text(verbatim: "FS").fontWeight(.bold).padding(.horizontal, 12).padding(.vertical, 8)
+                            Button(action: { addShader(category: .fragment, name: String(localized: "Fragment Layer")) }) {
+                                Text(verbatim: "FS").fontWeight(.bold).padding(.horizontal, 12).padding(.vertical, 8)
+                            }
+                            .buttonStyle(.plain).foregroundColor(.white).glassEffect(.regular.tint(.purple).interactive(), in: .rect(cornerRadius: 8)).help("Fragment Shader")
                         }
-                        .buttonStyle(.plain).background(Color.purple.opacity(0.8)).cornerRadius(8).foregroundColor(.white).help("Fragment Shader")
 
                         Button(action: { addShader(category: .fullscreen, name: String(localized: "Fullscreen Layer")) }) {
                             Text(verbatim: "PP").fontWeight(.bold).padding(.horizontal, 12).padding(.vertical, 8)
                         }
-                        .buttonStyle(.plain).background(Color.orange.opacity(0.8)).cornerRadius(8).foregroundColor(.white).help("Post Processing")
+                        .buttonStyle(.plain).foregroundColor(.white).glassEffect(.regular.tint(.orange).interactive(), in: .rect(cornerRadius: 8)).help("Post Processing")
                     }
-                    .padding(10).background(Color.black.opacity(0.6)).cornerRadius(12).padding()
+                    .padding(10).glassEffect(.regular.tint(Color(white: 0.15)), in: .rect(cornerRadius: 12)).padding()
 
                     Spacer()
 
-                    // Mesh and background controls.
+                    // Right-side controls (mode-aware).
                     HStack(spacing: 12) {
+                        // Background image (available in both modes).
                         Button(action: { fileImporterMode = .background; fileImporterPresented = true }) {
                             Image(systemName: "photo.fill").font(.title2)
                                 .foregroundColor(backgroundImage != nil ? .green : .white)
@@ -301,39 +353,86 @@ struct ContentView: View {
 
                         if backgroundImage != nil {
                             Button(action: { backgroundImage = nil }) {
-                                Image(systemName: "photo.badge.minus").font(.title3)
+                                Image(systemName: "xmark.circle").font(.title3)
                                     .foregroundColor(.red.opacity(0.8))
                             }.buttonStyle(.plain).help("Remove Background")
                         }
 
+                        if canvasMode.is2D {
+                            Divider().frame(height: 24).background(Color.white.opacity(0.3))
+
+                            Button(action: { addObject2D() }) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "plus.square.fill").font(.title2)
+                                    Text("Object").font(.caption)
+                                }
+                                .foregroundColor(.white)
+                            }
+                            .buttonStyle(.plain)
+                            .help(String(localized: "Add Object"))
+
+                            Button(action: { canvasZoom = 1.0; canvasPan = .zero }) {
+                                Image(systemName: "arrow.up.left.and.arrow.down.right").font(.title2)
+                                    .foregroundColor(.white.opacity(0.7))
+                            }
+                            .buttonStyle(.plain)
+                            .help(String(localized: "Reset Zoom/Pan"))
+                        }
+
+                        if canvasMode.is3D {
+                            // 3D mesh selection controls.
+                            Divider().frame(height: 24).background(Color.white.opacity(0.3))
+
+                            Button(action: { meshType = .sphere; customFileName = nil }) {
+                                Image(systemName: "circle.fill").font(.title2)
+                                    .foregroundColor(meshType == .sphere ? .blue : .white)
+                            }.buttonStyle(.plain).help("Sphere")
+
+                            Button(action: { meshType = .cube; customFileName = nil }) {
+                                Image(systemName: "square.fill").font(.title2)
+                                    .foregroundColor(meshType == .cube ? .blue : .white)
+                            }.buttonStyle(.plain).help("Cube")
+
+                            Button(action: { fileImporterMode = .mesh; fileImporterPresented = true }) {
+                                Image(systemName: "cube.box.fill").font(.title2)
+                                    .foregroundColor({ if case .custom = meshType { return Color.blue }; return Color.white }())
+                            }.buttonStyle(.plain).help(customFileName ?? String(localized: "Upload Custom Model..."))
+
+                            Divider().frame(height: 24).background(Color.white.opacity(0.3))
+
+                            Image(systemName: "rotate.3d")
+                                .font(.caption)
+                                .foregroundColor(.white.opacity(0.6))
+
+                            Slider(value: $rotationAngle, in: 0...360)
+                                .frame(width: 100)
+
+                            Text(String(format: "%.0f°", rotationAngle))
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundColor(.white.opacity(0.7))
+                                .frame(width: 32, alignment: .trailing)
+
+                            Button(action: { rotationAngle = 0 }) {
+                                Image(systemName: "arrow.counterclockwise")
+                                    .font(.caption2)
+                                    .foregroundColor(rotationAngle == 0 ? .white.opacity(0.3) : .orange)
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(rotationAngle == 0)
+                            .help(String(localized: "Reset to 0°"))
+                        }
+
                         Divider().frame(height: 24).background(Color.white.opacity(0.3))
 
-                        Button(action: { meshType = .sphere; customFileName = nil }) {
-                            Image(systemName: "circle.fill").font(.title2)
-                                .foregroundColor(meshType == .sphere ? .blue : .white)
-                        }.buttonStyle(.plain).help("Sphere")
-
-                        Button(action: { meshType = .cube; customFileName = nil }) {
-                            Image(systemName: "square.fill").font(.title2)
-                                .foregroundColor(meshType == .cube ? .blue : .white)
-                        }.buttonStyle(.plain).help("Cube")
-
-                        Button(action: { fileImporterMode = .mesh; fileImporterPresented = true }) {
-                            Image(systemName: "cube.box.fill").font(.title2)
-                                .foregroundColor({ if case .custom = meshType { return Color.blue }; return Color.white }())
-                        }.buttonStyle(.plain).help(customFileName ?? String(localized: "Upload Custom Model..."))
-
-                        Divider().frame(height: 24).background(Color.white.opacity(0.3))
-
-                        Button(action: { withAnimation { isRotationPaused.toggle() } }) {
-                            Image(systemName: isRotationPaused ? "arrow.counterclockwise" : "rotate.3d")
-                                .font(.title2)
-                                .foregroundColor(isRotationPaused ? .orange : .white)
+                        // Back to Hub button.
+                        Button(action: { requestNavigateBackToHub() }) {
+                            Image(systemName: "house.fill").font(.title2)
+                                .foregroundColor(.white.opacity(0.7))
                         }
                         .buttonStyle(.plain)
-                        .help(isRotationPaused ? String(localized: "Resume Rotation") : String(localized: "Reset & Pause Rotation"))
+                        .help("Back to Hub")
                     }
-                    .padding(10).background(Color.black.opacity(0.6)).cornerRadius(12).padding()
+                    .padding(10).glassEffect(.regular.tint(Color(white: 0.15)), in: .rect(cornerRadius: 12)).padding()
                 }
             }
 
@@ -388,10 +487,7 @@ struct ContentView: View {
                                     .textSelection(.enabled)
                             }
                             .padding(10)
-                            .background(Color.red.opacity(0.15))
-                            .background(.ultraThinMaterial)
-                            .cornerRadius(8)
-                            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.red.opacity(0.4), lineWidth: 1))
+                            .glassEffect(.regular.tint(.red), in: .rect(cornerRadius: 8))
                             .padding(8)
                             .transition(.move(edge: .bottom).combined(with: .opacity))
                         }
@@ -403,27 +499,77 @@ struct ContentView: View {
                 .zIndex(1)
             }
 
-            // AI Chat overlay (bottom center).
+            // 2D Shader editor panel (slides in from the right).
+            if let target = editing2DShaderTarget {
+                HStack(spacing: 0) {
+                    Spacer()
+                    ZStack(alignment: .bottom) {
+                        shader2DEditorPanel(target: target)
+
+                        if let error = compilationError {
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack {
+                                    Image(systemName: "xmark.octagon.fill")
+                                        .foregroundColor(.red)
+                                    Text("Compile Error")
+                                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                        .foregroundColor(.red)
+                                    Spacer()
+                                    Button(action: { compilationError = nil }) {
+                                        Image(systemName: "xmark")
+                                            .font(.system(size: 9))
+                                            .foregroundColor(.white.opacity(0.5))
+                                    }.buttonStyle(.plain)
+                                }
+                                Text(error)
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundColor(.white.opacity(0.85))
+                                    .lineLimit(6)
+                                    .textSelection(.enabled)
+                            }
+                            .padding(10)
+                            .glassEffect(.regular.tint(.red), in: .rect(cornerRadius: 8))
+                            .padding(8)
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                        }
+                    }
+                    .frame(width: 500)
+                    .transition(.move(edge: .trailing))
+                }
+                .zIndex(1.5)
+            }
+
+            // AI Chat panel (slides in from the right).
             if isAIChatActive {
-                VStack {
+                HStack(spacing: 0) {
                     Spacer()
                     AIChatView(
                         messages: $chatMessages,
                         isActive: $isAIChatActive,
                         activeShaders: activeShaders,
                         aiSettings: aiSettings,
+                        canvasMode: canvasMode,
                         dataFlowConfig: dataFlowConfig,
+                        dataFlow2DConfig: dataFlow2DConfig,
+                        objects2D: objects2D,
+                        sharedVertexCode2D: sharedVertexCode2D,
+                        sharedFragmentCode2D: sharedFragmentCode2D,
+                        compilationError: compilationError,
+                        paramValues: paramValues,
+                        meshType: meshType,
+                        rotationAngle: Float(rotationAngle),
+                        selectedObjectID: selectedObjectID,
                         onGenerateTutorial: { steps in loadAITutorial(steps) },
                         onAgentActions: { actions in executeAgentActions(actions) }
                     )
-                    .frame(maxHeight: 400)
-                    .padding(.horizontal, 20)
-                    .padding(.bottom, 80)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .frame(width: 420)
+                    .padding(.top, 48)
+                    .padding(.bottom, 64)
+                    .padding(.trailing, 16)
+                    .transition(.move(edge: .trailing))
                 }
                 .zIndex(2)
 
-                // Apple Intelligence-style animated gradient border.
                 AIGlowBorder()
                     .zIndex(3)
                     .transition(.opacity)
@@ -460,9 +606,7 @@ struct ContentView: View {
                     }
                     .padding(.horizontal, 16)
                     .padding(.vertical, 10)
-                    .background(.ultraThinMaterial)
-                    .background(Color.black.opacity(0.5))
-                    .cornerRadius(10)
+                    .glassEffect(.regular.tint(Color(white: 0.15)), in: .rect(cornerRadius: 10))
                     .shadow(color: .black.opacity(0.3), radius: 8, y: 4)
                     .padding(.bottom, 80)
                 }
@@ -471,7 +615,20 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 800, minHeight: 600)
-        // Subscribe to menu command notifications.
+        .onAppear {
+            canvasMode = appState.canvasMode
+            if let url = appState.openFileURL {
+                openCanvas(from: url)
+            }
+        }
+        .onChange(of: activeShaders) { hasUnsavedChanges = true }
+        .onChange(of: objects2D) { hasUnsavedChanges = true }
+        .onChange(of: paramValues) { hasUnsavedChanges = true }
+        .onChange(of: canvasName) { hasUnsavedChanges = true }
+        .onChange(of: dataFlowConfig) { hasUnsavedChanges = true }
+        .onChange(of: dataFlow2DConfig) { hasUnsavedChanges = true }
+        .onChange(of: sharedVertexCode2D) { hasUnsavedChanges = true }
+        .onChange(of: sharedFragmentCode2D) { hasUnsavedChanges = true }
         .onReceive(NotificationCenter.default.publisher(for: .canvasNew)) { _ in
             showingNewCanvasConfirm = true
         }
@@ -493,9 +650,32 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: .aiChat)) { _ in
             withAnimation(.easeInOut(duration: 0.3)) { isAIChatActive.toggle() }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .backToHub)) { _ in
+            requestNavigateBackToHub()
+        }
         .onReceive(NotificationCenter.default.publisher(for: .shaderCompilationResult)) { notification in
             withAnimation(.easeInOut(duration: 0.2)) {
                 compilationError = notification.object as? String
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .canvas2DObjectSelected)) { notification in
+            selectedObjectID = notification.object as? UUID
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .canvas2DObjectMoved)) { notification in
+            guard let arr = notification.object as? [Any],
+                  let objID = arr[0] as? UUID,
+                  let px = arr[1] as? Float,
+                  let py = arr[2] as? Float,
+                  let idx = objects2D.firstIndex(where: { $0.id == objID }) else { return }
+            objects2D[idx].posX = px
+            objects2D[idx].posY = py
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .canvas2DZoomChanged)) { notification in
+            if let z = notification.object as? Float { canvasZoom = z }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .canvas2DPanChanged)) { notification in
+            if let arr = notification.object as? [Float], arr.count >= 2 {
+                canvasPan = simd_float2(arr[0], arr[1])
             }
         }
         .fileImporter(
@@ -527,6 +707,18 @@ struct ContentView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("Current canvas may have unsaved changes.")
+        }
+        .alert(String(localized: "Back to Hub"), isPresented: $showingBackToHubConfirm) {
+            Button(String(localized: "Save & Return"), role: nil) {
+                performSave()
+                navigateBackToHub()
+            }
+            Button(String(localized: "Discard & Return"), role: .destructive) {
+                navigateBackToHub()
+            }
+            Button(String(localized: "Cancel"), role: .cancel) {}
+        } message: {
+            Text("You have unsaved changes. Returning to Hub will discard your current progress.")
         }
         .sheet(isPresented: $showingAISettings) {
             AISettingsView(settings: aiSettings)
@@ -571,10 +763,18 @@ struct ContentView: View {
     ///   - name: The base display name (a counter suffix is appended).
     private func addShader(category: ShaderCategory, name: String) {
         let code: String
-        switch category {
-        case .vertex: code = ShaderSnippets.generateVertexDemo(config: dataFlowConfig)
-        case .fragment: code = ShaderSnippets.fragmentDemo
-        case .fullscreen: code = ShaderSnippets.fullscreenDemo
+        if canvasMode.is2D {
+            switch category {
+            case .vertex: code = ShaderSnippets.generateVertexDemo(config: dataFlowConfig)
+            case .fragment: code = ShaderSnippets.fragment2DDemo
+            case .fullscreen: code = ShaderSnippets.fullscreenDemo
+            }
+        } else {
+            switch category {
+            case .vertex: code = ShaderSnippets.generateVertexDemo(config: dataFlowConfig)
+            case .fragment: code = ShaderSnippets.fragmentDemo
+            case .fullscreen: code = ShaderSnippets.fullscreenDemo
+            }
         }
         let newShader = ActiveShader(category: category, name: "\(name) \(activeShaders.filter { $0.category == category }.count + 1)", code: code)
         activeShaders.append(newShader)
@@ -624,19 +824,23 @@ struct ContentView: View {
 
     // MARK: - AI Agent Actions
 
-    /// Executes a list of Agent actions: adds new layers or modifies existing ones.
+    /// Executes a list of Agent actions: adds/modifies layers, 2D objects, or 2D shaders.
     ///
     /// After executing all actions, re-sorts the layer list by category and
-    /// opens the shader editor for the first affected layer.
+    /// opens the shader editor for the first affected layer (3D) or selects
+    /// the first affected object (2D).
     private func executeAgentActions(_ actions: [AgentAction]) {
-        var firstAffectedID: UUID?
+        var firstAffectedShaderID: UUID?
+        var firstAffectedObjectID: UUID?
+
         for action in actions {
-            guard let category = action.shaderCategory else { continue }
             switch action.type {
             case .addLayer:
+                guard let category = action.shaderCategory else { continue }
                 let shader = ActiveShader(category: category, name: action.name, code: action.code)
                 activeShaders.append(shader)
-                if firstAffectedID == nil { firstAffectedID = shader.id }
+                if firstAffectedShaderID == nil { firstAffectedShaderID = shader.id }
+
             case .modifyLayer:
                 if let targetName = action.targetLayerName,
                    let index = activeShaders.firstIndex(where: { $0.name == targetName }) {
@@ -644,17 +848,77 @@ struct ContentView: View {
                     if !action.name.isEmpty && action.name != "Untitled" {
                         activeShaders[index].name = action.name
                     }
-                    if firstAffectedID == nil { firstAffectedID = activeShaders[index].id }
+                    if firstAffectedShaderID == nil { firstAffectedShaderID = activeShaders[index].id }
+                }
+
+            case .addObject2D:
+                let obj = Object2D(
+                    name: action.name,
+                    shapeType: action.shape2DType ?? .roundedRectangle,
+                    posX: action.posX ?? 0,
+                    posY: action.posY ?? 0,
+                    scaleW: action.scaleW ?? 0.5,
+                    scaleH: action.scaleH ?? 0.5,
+                    rotation: action.rotation ?? 0,
+                    cornerRadius: action.cornerRadius ?? 0.15
+                )
+                objects2D.append(obj)
+                if firstAffectedObjectID == nil { firstAffectedObjectID = obj.id }
+
+            case .modifyObject2D:
+                let targetName = action.targetObjectName ?? action.name
+                if let index = objects2D.firstIndex(where: { $0.name == targetName }) {
+                    if !action.name.isEmpty && action.name != "Untitled" {
+                        objects2D[index].name = action.name
+                    }
+                    if let shape = action.shape2DType { objects2D[index].shapeType = shape }
+                    if let x = action.posX { objects2D[index].posX = x }
+                    if let y = action.posY { objects2D[index].posY = y }
+                    if let w = action.scaleW { objects2D[index].scaleW = w }
+                    if let h = action.scaleH { objects2D[index].scaleH = h }
+                    if let r = action.rotation { objects2D[index].rotation = r }
+                    if let cr = action.cornerRadius { objects2D[index].cornerRadius = cr }
+                    if firstAffectedObjectID == nil { firstAffectedObjectID = objects2D[index].id }
+                }
+
+            case .setSharedShader2D:
+                switch action.category.lowercased() {
+                case "distortion", "vertex":
+                    sharedVertexCode2D = action.code
+                case "fragment":
+                    sharedFragmentCode2D = action.code
+                default:
+                    break
+                }
+
+            case .setObjectShader2D:
+                let targetName = action.targetObjectName ?? action.name
+                if let index = objects2D.firstIndex(where: { $0.name == targetName }) {
+                    switch action.category.lowercased() {
+                    case "distortion", "vertex":
+                        objects2D[index].customVertexCode = action.code.isEmpty ? nil : action.code
+                    case "fragment":
+                        objects2D[index].customFragmentCode = action.code.isEmpty ? nil : action.code
+                    default:
+                        break
+                    }
+                    if firstAffectedObjectID == nil { firstAffectedObjectID = objects2D[index].id }
                 }
             }
         }
+
         activeShaders.sort { s1, s2 in
             let order: [ShaderCategory: Int] = [.vertex: 0, .fragment: 1, .fullscreen: 2]
             return order[s1.category]! < order[s2.category]!
         }
-        if let id = firstAffectedID {
+
+        if let id = firstAffectedShaderID {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
                 withAnimation { editingShaderID = id }
+            }
+        } else if let id = firstAffectedObjectID {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                withAnimation { selectedObjectID = id }
             }
         }
     }
@@ -735,14 +999,25 @@ struct ContentView: View {
         activeShaders = []
         editingShaderID = nil
         meshType = .sphere
+        shape2DType = .roundedRectangle
         customFileName = nil
         backgroundImage = nil
         dataFlowConfig = DataFlowConfig()
+        dataFlow2DConfig = DataFlow2DConfig()
         paramValues = [:]
+        rotationAngle = 0
         canvasName = String(localized: "Untitled Canvas")
         currentFileURL = nil
         aiTutorialSteps = nil
         isAIChatActive = false
+        objects2D = []
+        sharedVertexCode2D = ShaderSnippets.distortion2DTemplate
+        sharedFragmentCode2D = ShaderSnippets.fragment2DDemo
+        selectedObjectID = nil
+        canvasZoom = 1.0
+        canvasPan = .zero
+        editing2DShaderTarget = nil
+        Task { @MainActor in hasUnsavedChanges = false }
     }
 
     /// Saves the canvas: to the existing file if previously saved, otherwise prompts Save As.
@@ -768,18 +1043,19 @@ struct ContentView: View {
     }
 
     /// Encodes the current workspace as JSON and writes it to disk.
-    ///
-    /// The CanvasDocument includes the canvas name, mesh type, and all shader layers.
-    /// Uses pretty-printed JSON with sorted keys for human readability.
+    /// Also captures a snapshot and registers the project in the recent list.
     private func saveCanvas(to url: URL) {
-        let doc = CanvasDocument(name: canvasName, meshType: meshType, shaders: activeShaders, dataFlow: dataFlowConfig, paramValues: paramValues)
+        let doc = CanvasDocument(name: canvasName, mode: canvasMode, meshType: meshType, shape2DType: shape2DType, shaders: activeShaders, dataFlow: dataFlowConfig, dataFlow2D: dataFlow2DConfig, paramValues: paramValues, objects2D: objects2D.isEmpty ? nil : objects2D, sharedVertexCode2D: sharedVertexCode2D, sharedFragmentCode2D: sharedFragmentCode2D)
         do {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             let data = try encoder.encode(doc)
             try data.write(to: url, options: .atomic)
             currentFileURL = url
+            hasUnsavedChanges = false
             print("Canvas saved to \(url.path)")
+
+            recentManager.addRecent(name: canvasName, fileURL: url, mode: canvasMode, snapshot: nil)
         } catch {
             print("Failed to save canvas: \(error)")
         }
@@ -804,76 +1080,503 @@ struct ContentView: View {
             let data = try Data(contentsOf: url)
             let doc = try JSONDecoder().decode(CanvasDocument.self, from: data)
             canvasName = doc.name
+            canvasMode = doc.mode
             meshType = doc.meshType
+            shape2DType = doc.shape2DType
             activeShaders = doc.shaders
             dataFlowConfig = doc.dataFlow
+            dataFlow2DConfig = doc.dataFlow2D
             paramValues = doc.paramValues
             currentFileURL = url
             editingShaderID = nil
+            editing2DShaderTarget = nil
+
+            objects2D = doc.objects2D ?? []
+            sharedVertexCode2D = doc.sharedVertexCode2D ?? ShaderSnippets.distortion2DTemplate
+            sharedFragmentCode2D = doc.sharedFragmentCode2D ?? ShaderSnippets.fragment2DDemo
+            selectedObjectID = nil
+            canvasZoom = 1.0
+            canvasPan = .zero
 
             if case .custom(let modelURL) = meshType {
                 customFileName = modelURL.lastPathComponent
             } else {
                 customFileName = nil
             }
+
+            recentManager.addRecent(name: doc.name, fileURL: url, mode: doc.mode)
+            Task { @MainActor in hasUnsavedChanges = false }
             print("Canvas loaded from \(url.path)")
         } catch {
             print("Failed to open canvas: \(error)")
         }
     }
-    
+
+    /// Checks for unsaved changes before navigating back to Hub.
+    private func requestNavigateBackToHub() {
+        if hasUnsavedChanges {
+            showingBackToHubConfirm = true
+        } else {
+            navigateBackToHub()
+        }
+    }
+
+    /// Navigates back to the Hub window.
+    private func navigateBackToHub() {
+        hasUnsavedChanges = false
+        appState.currentScreen = .hub
+        appState.openFileURL = nil
+    }
+
+    // MARK: - 2D Scene Helpers
+
+    private func addObject2D() {
+        let count = objects2D.count + 1
+        let obj = Object2D(name: "Object \(count)")
+        objects2D.append(obj)
+        selectedObjectID = obj.id
+    }
+
+    private func removeObject2D(_ id: UUID) {
+        objects2D.removeAll { $0.id == id }
+        if selectedObjectID == id { selectedObjectID = nil }
+    }
+
+    // MARK: - Collapsible Section Header
+
+    private func collapsibleHeader(_ title: String, isCollapsed: Binding<Bool>) -> some View {
+        Button(action: {
+            withAnimation(.easeInOut(duration: 0.2)) { isCollapsed.wrappedValue.toggle() }
+        }) {
+            HStack(spacing: 6) {
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.bold))
+                    .foregroundColor(.white.opacity(0.5))
+                    .rotationEffect(.degrees(isCollapsed.wrappedValue ? 0 : 90))
+                Text(title)
+                    .font(.headline)
+                    .foregroundColor(.white)
+                Spacer()
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: - 2D Sidebar
+
+    private var sidebar2DContent: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            // ─── Shared Shaders ───
+            VStack(alignment: .leading, spacing: 6) {
+                collapsibleHeader("Shared Shaders", isCollapsed: $isShadersCollapsed)
+
+                if !isShadersCollapsed {
+                    HStack {
+                        Image(systemName: "move.3d").foregroundColor(.cyan)
+                        Text("Vertex (Distortion)").foregroundColor(.white)
+                        Spacer()
+                        Button(action: {
+                            withAnimation { editing2DShaderTarget = .sharedVertex }
+                        }) {
+                            Image(systemName: "pencil.circle")
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundColor(.white.opacity(0.7))
+                    }
+                    .padding(8)
+                    .background(Color.black.opacity(0.4))
+                    .cornerRadius(6)
+
+                    HStack {
+                        Image(systemName: "paintbrush.fill").foregroundColor(.purple)
+                        Text("Fragment (Color)").foregroundColor(.white)
+                        Spacer()
+                        Button(action: {
+                            withAnimation { editing2DShaderTarget = .sharedFragment }
+                        }) {
+                            Image(systemName: "pencil.circle")
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundColor(.white.opacity(0.7))
+                    }
+                    .padding(8)
+                    .background(Color.black.opacity(0.4))
+                    .cornerRadius(6)
+                }
+            }
+
+            Divider().background(Color.white.opacity(0.2))
+
+            // ─── Objects ───
+            VStack(alignment: .leading, spacing: 6) {
+                collapsibleHeader("Objects", isCollapsed: $isObjectsCollapsed)
+
+                if !isObjectsCollapsed {
+                    if objects2D.isEmpty {
+                        Text("No objects yet")
+                            .font(.subheadline)
+                            .foregroundColor(.white.opacity(0.5))
+                    } else {
+                        ForEach(Array(objects2D.enumerated()), id: \.element.id) { idx, object in
+                            VStack(spacing: 0) {
+                                HStack {
+                                    Image(systemName: object.shapeType.icon)
+                                        .foregroundColor(selectedObjectID == object.id ? .blue : .white.opacity(0.6))
+                                    Text(object.name)
+                                        .foregroundColor(.white)
+                                        .lineLimit(1)
+                                    Spacer()
+                                    Button(action: { removeObject2D(object.id) }) {
+                                        Image(systemName: "xmark.circle.fill")
+                                    }
+                                    .buttonStyle(.plain)
+                                    .foregroundColor(.red.opacity(0.7))
+                                }
+                                .padding(8)
+                                .background(selectedObjectID == object.id ? Color.blue.opacity(0.2) : Color.black.opacity(0.4))
+                                .cornerRadius(6)
+                                .contentShape(Rectangle())
+                                .onTapGesture { selectedObjectID = object.id }
+
+                                if selectedObjectID == object.id {
+                                    objectPropertyInspector(index: idx)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Divider().background(Color.white.opacity(0.2))
+
+            // ─── Post Processing Layers ───
+            VStack(alignment: .leading, spacing: 6) {
+                collapsibleHeader("Post Processing", isCollapsed: $isPostProcessingCollapsed)
+
+                if !isPostProcessingCollapsed {
+                    let ppLayers = activeShaders.filter { $0.category == .fullscreen }
+                    if ppLayers.isEmpty {
+                        Text("No PP layers")
+                            .font(.subheadline)
+                            .foregroundColor(.white.opacity(0.5))
+                    } else {
+                        ForEach(ppLayers) { shader in
+                            HStack {
+                                Image(systemName: "display")
+                                    .foregroundColor(.orange)
+                                Text(verbatim: shader.name)
+                                    .foregroundColor(.white)
+                                Spacer()
+                                Button(action: {
+                                    withAnimation { editingShaderID = shader.id }
+                                }) {
+                                    Image(systemName: "pencil.circle")
+                                }
+                                .buttonStyle(.plain)
+                                .foregroundColor(.white.opacity(0.7))
+                                Button(action: { removeShader(shader) }) {
+                                    Image(systemName: "xmark.circle.fill")
+                                }
+                                .buttonStyle(.plain)
+                                .foregroundColor(.red.opacity(0.8))
+                            }
+                            .padding(8)
+                            .background(Color.black.opacity(0.4))
+                            .cornerRadius(6)
+                        }
+                    }
+                }
+            }
+        }
+        .frame(width: panelWidth)
+        .padding(12)
+        .glassEffect(.regular.tint(Color(white: 0.15)), in: .rect(cornerRadius: 12))
+        .transition(.move(edge: .leading).combined(with: .opacity))
+    }
+
+    @ViewBuilder
+    private func objectPropertyInspector(index idx: Int) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            // Shape selection
+            HStack(spacing: 4) {
+                Text("Shape").font(.caption).foregroundColor(.white.opacity(0.6))
+                Spacer()
+                ForEach(Shape2DType.allCases) { shape in
+                    Button(action: { objects2D[idx].shapeType = shape }) {
+                        Image(systemName: shape.icon).font(.caption)
+                            .foregroundColor(objects2D[idx].shapeType == shape ? .blue : .white.opacity(0.5))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            // Size sliders
+            HStack {
+                Text("W").font(.caption2).foregroundColor(.white.opacity(0.5))
+                Slider(value: $objects2D[idx].scaleW, in: 0.05...2.0)
+                Text("H").font(.caption2).foregroundColor(.white.opacity(0.5))
+                Slider(value: $objects2D[idx].scaleH, in: 0.05...2.0)
+            }
+
+            // Rotation
+            HStack {
+                Text("Rot").font(.caption2).foregroundColor(.white.opacity(0.5))
+                Slider(value: $objects2D[idx].rotation, in: -.pi...(.pi))
+            }
+
+            // Corner radius (visible for rounded rectangle)
+            if objects2D[idx].shapeType == .roundedRectangle {
+                HStack {
+                    Text("R").font(.caption2).foregroundColor(.white.opacity(0.5))
+                    Slider(value: $objects2D[idx].cornerRadius, in: 0.0...0.5)
+                }
+            }
+
+            // Shader status
+            HStack(spacing: 4) {
+                let hasCustomVS = objects2D[idx].customVertexCode != nil
+                let hasCustomFS = objects2D[idx].customFragmentCode != nil
+
+                Button(action: {
+                    if hasCustomVS {
+                        withAnimation { editing2DShaderTarget = .objectVertex(objects2D[idx].id) }
+                    } else {
+                        objects2D[idx].customVertexCode = sharedVertexCode2D
+                        withAnimation { editing2DShaderTarget = .objectVertex(objects2D[idx].id) }
+                    }
+                }) {
+                    Text("VS")
+                        .font(.system(size: 10, weight: .bold))
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .foregroundColor(hasCustomVS ? .blue : .white.opacity(0.5))
+                        .background(hasCustomVS ? Color.blue.opacity(0.15) : Color.clear)
+                        .cornerRadius(4)
+                }
+                .buttonStyle(.plain)
+
+                if hasCustomVS {
+                    Button(action: { objects2D[idx].customVertexCode = nil }) {
+                        Image(systemName: "arrow.uturn.backward.circle").font(.caption2)
+                            .foregroundColor(.orange.opacity(0.8))
+                    }.buttonStyle(.plain).help(String(localized: "Revert to shared VS"))
+                }
+
+                Button(action: {
+                    if hasCustomFS {
+                        withAnimation { editing2DShaderTarget = .objectFragment(objects2D[idx].id) }
+                    } else {
+                        objects2D[idx].customFragmentCode = sharedFragmentCode2D
+                        withAnimation { editing2DShaderTarget = .objectFragment(objects2D[idx].id) }
+                    }
+                }) {
+                    Text("FS")
+                        .font(.system(size: 10, weight: .bold))
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .foregroundColor(hasCustomFS ? .purple : .white.opacity(0.5))
+                        .background(hasCustomFS ? Color.purple.opacity(0.15) : Color.clear)
+                        .cornerRadius(4)
+                }
+                .buttonStyle(.plain)
+
+                if hasCustomFS {
+                    Button(action: { objects2D[idx].customFragmentCode = nil }) {
+                        Image(systemName: "arrow.uturn.backward.circle").font(.caption2)
+                            .foregroundColor(.orange.opacity(0.8))
+                    }.buttonStyle(.plain).help(String(localized: "Revert to shared FS"))
+                }
+
+                Spacer()
+                Text(hasCustomVS || hasCustomFS ? "Custom" : "Shared")
+                    .font(.system(size: 9))
+                    .foregroundColor(.white.opacity(0.4))
+            }
+        }
+        .padding(8)
+        .background(Color.blue.opacity(0.05))
+        .cornerRadius(6)
+    }
+
+    // MARK: - 2D Shader Editor Panel
+
+    @ViewBuilder
+    private func shader2DEditorPanel(target: Edit2DShaderTarget) -> some View {
+        switch target {
+        case .sharedVertex:
+            Shared2DShaderEditorView(
+                title: "Shared Vertex (Distortion)",
+                code: $sharedVertexCode2D,
+                onClose: { withAnimation { editing2DShaderTarget = nil } }
+            )
+        case .sharedFragment:
+            Shared2DShaderEditorView(
+                title: "Shared Fragment (Color)",
+                code: $sharedFragmentCode2D,
+                onClose: { withAnimation { editing2DShaderTarget = nil } }
+            )
+        case .objectVertex(let objID):
+            if let idx = objects2D.firstIndex(where: { $0.id == objID }),
+               objects2D[idx].customVertexCode != nil {
+                ObjectCustomShaderEditorView(
+                    title: "\(objects2D[idx].name) — Custom VS",
+                    code: Binding(
+                        get: { objects2D[idx].customVertexCode ?? "" },
+                        set: { objects2D[idx].customVertexCode = $0 }
+                    ),
+                    onClose: { withAnimation { editing2DShaderTarget = nil } }
+                )
+            }
+        case .objectFragment(let objID):
+            if let idx = objects2D.firstIndex(where: { $0.id == objID }),
+               objects2D[idx].customFragmentCode != nil {
+                ObjectCustomShaderEditorView(
+                    title: "\(objects2D[idx].name) — Custom FS",
+                    code: Binding(
+                        get: { objects2D[idx].customFragmentCode ?? "" },
+                        set: { objects2D[idx].customFragmentCode = $0 }
+                    ),
+                    onClose: { withAnimation { editing2DShaderTarget = nil } }
+                )
+            }
+        }
+    }
+
     // MARK: - Data Flow Panel
     
     private var dataFlowPanel: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Data Flow")
-                .font(.headline)
-                .foregroundColor(.white)
-                .padding(.bottom, 2)
+            collapsibleHeader("Data Flow", isCollapsed: $isDataFlowCollapsed)
             
-            Text("Vertex fields shared across all mesh shaders")
-                .font(.caption2)
-                .foregroundColor(.white.opacity(0.5))
-                .padding(.bottom, 4)
-            
-            Group {
-                dataFlowToggle(label: "Normal", icon: "arrow.up.right", binding: $dataFlowConfig.normalEnabled, locked: false)
-                dataFlowToggle(label: "UV", icon: "squareshape.split.2x2", binding: $dataFlowConfig.uvEnabled, locked: false)
-                dataFlowToggle(label: "Time", icon: "clock", binding: $dataFlowConfig.timeEnabled, locked: false)
+            if !isDataFlowCollapsed {
+                Text("Vertex fields shared across all mesh shaders")
+                    .font(.caption2)
+                    .foregroundColor(.white.opacity(0.5))
+                    .padding(.bottom, 4)
+                
+                Group {
+                    dataFlowToggle(label: "Normal", icon: "arrow.up.right", binding: $dataFlowConfig.normalEnabled, locked: false)
+                    dataFlowToggle(label: "UV", icon: "squareshape.split.2x2", binding: $dataFlowConfig.uvEnabled, locked: false)
+                    dataFlowToggle(label: "Time", icon: "clock", binding: $dataFlowConfig.timeEnabled, locked: false)
+                }
+                
+                Divider().background(Color.white.opacity(0.2))
+                
+                Text("Extended")
+                    .font(.caption)
+                    .foregroundColor(.white.opacity(0.6))
+                    .padding(.top, 2)
+                
+                Group {
+                    dataFlowToggle(label: "World Position", icon: "globe", binding: $dataFlowConfig.worldPositionEnabled, locked: false)
+                    dataFlowToggle(label: "World Normal", icon: "arrow.up.forward.circle", binding: $dataFlowConfig.worldNormalEnabled, locked: !dataFlowConfig.normalEnabled)
+                    dataFlowToggle(label: "View Direction", icon: "eye", binding: $dataFlowConfig.viewDirectionEnabled, locked: !dataFlowConfig.worldPositionEnabled)
+                }
+                
+                Divider().background(Color.white.opacity(0.2))
+                
+                dataFlowPreview
             }
-            
-            Divider().background(Color.white.opacity(0.2))
-            
-            Text("Extended")
-                .font(.caption)
-                .foregroundColor(.white.opacity(0.6))
-                .padding(.top, 2)
-            
-            Group {
-                dataFlowToggle(label: "World Position", icon: "globe", binding: $dataFlowConfig.worldPositionEnabled, locked: false)
-                dataFlowToggle(label: "World Normal", icon: "arrow.up.forward.circle", binding: $dataFlowConfig.worldNormalEnabled, locked: !dataFlowConfig.normalEnabled)
-                dataFlowToggle(label: "View Direction", icon: "eye", binding: $dataFlowConfig.viewDirectionEnabled, locked: !dataFlowConfig.worldPositionEnabled)
-            }
-            
-            Divider().background(Color.white.opacity(0.2))
-            
-            dataFlowPreview
         }
-        .frame(width: 220)
+        .frame(width: panelWidth)
         .padding(12)
-        .background(Color.black.opacity(0.6))
-        .cornerRadius(12)
+        .glassEffect(.regular.tint(Color(white: 0.15)), in: .rect(cornerRadius: 12))
         .transition(.move(edge: .leading).combined(with: .opacity))
         .onChange(of: dataFlowConfig) { _ in
             dataFlowConfig.resolveDependencies()
         }
     }
     
-    /// Parsed @param declarations from the currently editing shader only.
+    // MARK: - 2D Data Flow Panel
+
+    private var dataFlow2DPanel: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            collapsibleHeader("Data Flow", isCollapsed: $isDataFlowCollapsed)
+
+            if !isDataFlowCollapsed {
+                Text("Vertex fields for all 2D object shaders")
+                    .font(.caption2)
+                    .foregroundColor(.white.opacity(0.5))
+                    .padding(.bottom, 4)
+
+                Group {
+                    dataFlowToggle(label: "Time", icon: "clock", binding: $dataFlow2DConfig.timeEnabled, locked: false)
+                    dataFlowToggle(label: "Mouse", icon: "cursorarrow.motionlines", binding: $dataFlow2DConfig.mouseEnabled, locked: false)
+                    dataFlowToggle(label: "Object Position", icon: "square.on.square.dashed", binding: $dataFlow2DConfig.objectPositionEnabled, locked: false)
+                    dataFlowToggle(label: "Screen UV", icon: "rectangle.dashed", binding: $dataFlow2DConfig.screenUVEnabled, locked: false)
+                }
+
+                Divider().background(Color.white.opacity(0.2))
+
+                dataFlow2DPreview
+            }
+        }
+        .frame(width: panelWidth)
+        .padding(12)
+        .glassEffect(.regular.tint(Color(white: 0.15)), in: .rect(cornerRadius: 12))
+        .transition(.move(edge: .leading).combined(with: .opacity))
+    }
+
+    private var dataFlow2DPreview: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("Generated Structs")
+                    .font(.caption2)
+                    .foregroundColor(.white.opacity(0.5))
+                Spacer()
+            }
+
+            ScrollView {
+                Text(ShaderSnippets.generateStructPreview2D(config: dataFlow2DConfig))
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundColor(.green.opacity(0.8))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxHeight: 160)
+            .padding(6)
+            .background(Color.black.opacity(0.5))
+            .cornerRadius(6)
+        }
+    }
+
+    /// Parsed @param declarations from the currently editing shader.
+    /// In 3D mode: from the active shader layer being edited.
+    /// In 2D mode: from the currently editing shared/per-object shader.
     private var allParsedParams: [ShaderParam] {
+        if canvasMode.is2D {
+            return parsed2DParams
+        }
         guard let editingID = editingShaderID,
               let shader = activeShaders.first(where: { $0.id == editingID }) else { return [] }
         return ShaderSnippets.parseParams(from: shader.code)
+    }
+
+    private var parsed2DParams: [ShaderParam] {
+        guard let target = editing2DShaderTarget else {
+            // No editor open — show params from the selected object or shared shaders
+            var codes = [sharedVertexCode2D, sharedFragmentCode2D]
+            if let selID = selectedObjectID, let obj = objects2D.first(where: { $0.id == selID }) {
+                if let vs = obj.customVertexCode { codes.append(vs) }
+                if let fs = obj.customFragmentCode { codes.append(fs) }
+            }
+            var result: [ShaderParam] = []; var seen = Set<String>()
+            for code in codes {
+                for p in ShaderSnippets.parseParams(from: code) {
+                    if seen.insert(p.name).inserted { result.append(p) }
+                }
+            }
+            return result
+        }
+        switch target {
+        case .sharedVertex:   return ShaderSnippets.parseParams(from: sharedVertexCode2D)
+        case .sharedFragment: return ShaderSnippets.parseParams(from: sharedFragmentCode2D)
+        case .objectVertex(let id):
+            guard let obj = objects2D.first(where: { $0.id == id }), let code = obj.customVertexCode else { return [] }
+            return ShaderSnippets.parseParams(from: code)
+        case .objectFragment(let id):
+            guard let obj = objects2D.first(where: { $0.id == id }), let code = obj.customFragmentCode else { return [] }
+            return ShaderSnippets.parseParams(from: code)
+        }
     }
     
     private func dataFlowToggle(label: String, icon: String, binding: Binding<Bool>, locked: Bool) -> some View {
@@ -920,14 +1623,10 @@ struct ContentView: View {
     
     private var parametersPanel: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text("Parameters")
-                    .font(.headline)
-                    .foregroundColor(.white)
+            HStack(spacing: 6) {
+                collapsibleHeader("Parameters", isCollapsed: $isParametersCollapsed)
                 
-                Spacer()
-                
-                if editingShaderID != nil {
+                if !isParametersCollapsed, editingShaderID != nil || editing2DShaderTarget != nil {
                     Menu {
                         Button("Float Slider") { addParamToEditingShader(type: .float, withRange: true) }
                         Button("Float Input") { addParamToEditingShader(type: .float, withRange: false) }
@@ -948,23 +1647,24 @@ struct ContentView: View {
                 }
             }
             
-            if allParsedParams.isEmpty {
-                Text(editingShaderID != nil
-                     ? "Use + to add parameters, or write\n// @param _name type default ..."
-                     : "No parameters declared")
-                    .font(.caption2)
-                    .foregroundColor(.white.opacity(0.4))
-                    .padding(.vertical, 4)
-            } else {
-                ForEach(allParsedParams, id: \.name) { param in
-                    paramControl(for: param)
+            if !isParametersCollapsed {
+                if allParsedParams.isEmpty {
+                    Text((editingShaderID != nil || editing2DShaderTarget != nil)
+                         ? "Use + to add parameters, or write\n// @param _name type default ..."
+                         : "No parameters declared")
+                        .font(.caption2)
+                        .foregroundColor(.white.opacity(0.4))
+                        .padding(.vertical, 4)
+                } else {
+                    ForEach(allParsedParams, id: \.name) { param in
+                        paramControl(for: param)
+                    }
                 }
             }
         }
-        .frame(width: 220)
+        .frame(width: panelWidth)
         .padding(12)
-        .background(Color.black.opacity(0.6))
-        .cornerRadius(12)
+        .glassEffect(.regular.tint(Color(white: 0.15)), in: .rect(cornerRadius: 12))
         .transition(.move(edge: .leading).combined(with: .opacity))
     }
     
@@ -990,28 +1690,39 @@ struct ContentView: View {
     
     /// Injects a `// @param` directive at the top of the currently editing shader's code.
     private func addParamToEditingShader(type: ParamType, withRange: Bool) {
-        guard let editingID = editingShaderID,
-              let index = activeShaders.firstIndex(where: { $0.id == editingID }) else { return }
-        
         let name = nextParamName(type: type)
         var directive: String
-        
         switch type {
         case .float:
             directive = withRange
                 ? "// @param \(name) float 0.5 0.0 1.0"
                 : "// @param \(name) float 0.0"
-        case .float2:
-            directive = "// @param \(name) float2 0.0 0.0"
-        case .float3:
-            directive = "// @param \(name) float3 0.0 0.0 0.0"
-        case .float4:
-            directive = "// @param \(name) float4 0.0 0.0 0.0 0.0"
-        case .color:
-            directive = "// @param \(name) color 1.0 1.0 1.0"
+        case .float2:  directive = "// @param \(name) float2 0.0 0.0"
+        case .float3:  directive = "// @param \(name) float3 0.0 0.0 0.0"
+        case .float4:  directive = "// @param \(name) float4 0.0 0.0 0.0 0.0"
+        case .color:   directive = "// @param \(name) color 1.0 1.0 1.0"
         }
-        
-        activeShaders[index].code = directive + "\n" + activeShaders[index].code
+
+        // 3D mode: inject into the active shader layer
+        if let editingID = editingShaderID,
+           let index = activeShaders.firstIndex(where: { $0.id == editingID }) {
+            activeShaders[index].code = directive + "\n" + activeShaders[index].code
+            return
+        }
+        // 2D mode: inject into the currently editing 2D shader target
+        guard let target = editing2DShaderTarget else { return }
+        switch target {
+        case .sharedVertex:   sharedVertexCode2D = directive + "\n" + sharedVertexCode2D
+        case .sharedFragment: sharedFragmentCode2D = directive + "\n" + sharedFragmentCode2D
+        case .objectVertex(let id):
+            if let idx = objects2D.firstIndex(where: { $0.id == id }) {
+                objects2D[idx].customVertexCode = directive + "\n" + (objects2D[idx].customVertexCode ?? "")
+            }
+        case .objectFragment(let id):
+            if let idx = objects2D.firstIndex(where: { $0.id == id }) {
+                objects2D[idx].customFragmentCode = directive + "\n" + (objects2D[idx].customFragmentCode ?? "")
+            }
+        }
     }
     
     /// Renames a parameter across all shader code and transfers its stored value.
@@ -1240,11 +1951,34 @@ struct ContentView: View {
         }
         
         let newDirective = "// @param \(name) \(param.type.rawValue) \(valueStrs.joined(separator: " "))"
-        
+
+        // Try replacing in 3D active shader layers
         for i in activeShaders.indices {
             let code = activeShaders[i].code
             if let match = regex.firstMatch(in: code, range: NSRange(code.startIndex..., in: code)) {
                 activeShaders[i].code = (code as NSString).replacingCharacters(in: match.range, with: newDirective)
+                return
+            }
+        }
+        // Try replacing in 2D shared shaders
+        for code in [sharedVertexCode2D, sharedFragmentCode2D] {
+            if let match = regex.firstMatch(in: code, range: NSRange(code.startIndex..., in: code)) {
+                let replaced = (code as NSString).replacingCharacters(in: match.range, with: newDirective)
+                if code == sharedVertexCode2D { sharedVertexCode2D = replaced }
+                else { sharedFragmentCode2D = replaced }
+                return
+            }
+        }
+        // Try replacing in 2D per-object custom shaders
+        for i in objects2D.indices {
+            if let code = objects2D[i].customVertexCode,
+               let match = regex.firstMatch(in: code, range: NSRange(code.startIndex..., in: code)) {
+                objects2D[i].customVertexCode = (code as NSString).replacingCharacters(in: match.range, with: newDirective)
+                return
+            }
+            if let code = objects2D[i].customFragmentCode,
+               let match = regex.firstMatch(in: code, range: NSRange(code.startIndex..., in: code)) {
+                objects2D[i].customFragmentCode = (code as NSString).replacingCharacters(in: match.range, with: newDirective)
                 return
             }
         }
@@ -1722,6 +2456,68 @@ struct TutorialPanel: View {
     }
 }
 
+// MARK: - Shared 2D Shader Editor View
+
+struct Shared2DShaderEditorView: View {
+    let title: String
+    @Binding var code: String
+    var onClose: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text(title)
+                    .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                    .foregroundColor(.white)
+                Spacer()
+                Button(action: onClose) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.title3)
+                        .foregroundColor(.white.opacity(0.6))
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 12).padding(.vertical, 8)
+            .background(Color.black.opacity(0.6))
+
+            CodeEditor(text: $code)
+        }
+        .background(Color.black.opacity(0.85))
+        .cornerRadius(10)
+    }
+}
+
+// MARK: - Object Custom Shader Editor View
+
+struct ObjectCustomShaderEditorView: View {
+    let title: String
+    @Binding var code: String
+    var onClose: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text(title)
+                    .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                    .foregroundColor(.white)
+                Spacer()
+                Button(action: onClose) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.title3)
+                        .foregroundColor(.white.opacity(0.6))
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 12).padding(.vertical, 8)
+            .background(Color.black.opacity(0.6))
+
+            CodeEditor(text: $code)
+        }
+        .background(Color.black.opacity(0.85))
+        .cornerRadius(10)
+    }
+}
+
 #Preview {
-    ContentView()
+    ContentView(appState: AppState(), recentManager: RecentProjectManager())
 }

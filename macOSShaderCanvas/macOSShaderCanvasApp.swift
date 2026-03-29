@@ -40,12 +40,25 @@ import SwiftUI
 /// replacing the traditional AppDelegate / NSApplicationMain pattern.
 @main
 struct macOSShaderCanvasApp: App {
+    @State private var appState = AppState()
+    @State private var recentManager = RecentProjectManager()
+
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            Group {
+                if appState.currentScreen == .hub {
+                    HubView(appState: appState, recentManager: recentManager)
+                } else if appState.canvasMode.isLab {
+                    LabView(appState: appState, recentManager: recentManager)
+                } else {
+                    ContentView(appState: appState, recentManager: recentManager)
+                }
+            }
+            .animation(.easeInOut(duration: 0.25), value: appState.currentScreen == .hub)
+            .preferredColorScheme(.dark)
         }
+        .windowStyle(.hiddenTitleBar)
         .commands {
-            // Replace the default "New" menu item with canvas-specific commands.
             CommandGroup(replacing: .newItem) {
                 Button("New Canvas") {
                     NotificationCenter.default.post(name: .canvasNew, object: nil)
@@ -58,9 +71,15 @@ struct macOSShaderCanvasApp: App {
                     NotificationCenter.default.post(name: .canvasOpen, object: nil)
                 }
                 .keyboardShortcut("o")
+
+                Divider()
+
+                Button("Back to Hub") {
+                    NotificationCenter.default.post(name: .backToHub, object: nil)
+                }
+                .keyboardShortcut("h", modifiers: [.command, .shift])
             }
 
-            // Add the Tutorial command after the New/Open section.
             CommandGroup(after: .newItem) {
                 Divider()
 
@@ -70,7 +89,6 @@ struct macOSShaderCanvasApp: App {
                 .keyboardShortcut("t", modifiers: [.command, .shift])
             }
 
-            // Replace the default Save menu items with canvas-aware versions.
             CommandGroup(replacing: .saveItem) {
                 Button("Save") {
                     NotificationCenter.default.post(name: .canvasSave, object: nil)
@@ -83,7 +101,6 @@ struct macOSShaderCanvasApp: App {
                 .keyboardShortcut("s", modifiers: [.command, .shift])
             }
 
-            // Custom "AI" menu for AI chat and settings.
             CommandMenu("AI") {
                 Button("AI Chat") {
                     NotificationCenter.default.post(name: .aiChat, object: nil)
