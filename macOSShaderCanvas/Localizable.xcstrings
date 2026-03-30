@@ -141,6 +141,16 @@
     "AI Chat (⌘L)" : {
 
     },
+    "AI requests SDF access for \"%@\" (%@). Locking the shape enables edge-aware effects but prevents shape changes." : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "AI requests SDF access for \"%1$@\" (%2$@). Locking the shape enables edge-aware effects but prevents shape changes."
+          }
+        }
+      }
+    },
     "AI Settings" : {
 
     },
@@ -272,6 +282,9 @@
     "Decision: %@" : {
 
     },
+    "Deny" : {
+
+    },
     "Describe what shader technique you want to learn." : {
 
     },
@@ -293,6 +306,9 @@
           }
         }
       }
+    },
+    "Discard & Return" : {
+
     },
     "Done" : {
       "localizations" : {
@@ -510,6 +526,12 @@
           }
         }
       }
+    },
+    "Lock" : {
+
+    },
+    "Lock Shape" : {
+
     },
     "Metal Shader Canvas" : {
 
@@ -889,6 +911,9 @@
         }
       }
     },
+    "Save & Return" : {
+
+    },
     "Save As..." : {
       "localizations" : {
         "ja" : {
@@ -928,6 +953,9 @@
 
     },
     "Shape" : {
+
+    },
+    "Shape locked — SDF access enabled for this object's shader" : {
 
     },
     "Shared" : {
@@ -1014,6 +1042,9 @@
           }
         }
       }
+    },
+    "Unlock shape (may break edge-aware shader effects)" : {
+
     },
     "Untitled Canvas" : {
       "localizations" : {
@@ -1123,6 +1154,9 @@
 
     },
     "y" : {
+
+    },
+    "You have unsaved changes. Returning to Hub will discard your current progress." : {
 
     },
     "z" : {

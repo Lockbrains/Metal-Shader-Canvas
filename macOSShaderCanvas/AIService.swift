@@ -149,6 +149,23 @@ actor AIService {
           "compilationResult" = result of previous compilation
           "paramValues" = current parameter values
 
+        SHAPE LOCK REQUIREMENT (2D mode):
+        If the request involves ANY edge-aware effects (edge glow, rim light, inner shadow,
+        border, frosted glass with edge falloff, thickness simulation, contour gradient,
+        edge-based refraction, shape-contour-following effects), the plan MUST include a
+        dedicated "Request Shape Lock" step BEFORE any step that implements edge effects.
+        This is because the only correct way to compute distance-to-edge in 2D mode is via
+        the system-provided _sdf_shape() function, which requires the user to lock the
+        object's shape first. The shape lock step uses a requestShapeLock action.
+        DO NOT plan steps that compute edge distance from UV coordinates — this approach is
+        INCORRECT for non-rectangular shapes (e.g. the G∞-continuous squircle).
+
+        USER CONTENT PROTECTION:
+        Your actions NEVER modify the user's original objects or shared shaders.
+        Every setObjectShader2D automatically creates a new AI preview clone.
+        Do NOT use setSharedShader2D. Do NOT use modifyObject2D on user objects.
+        Only write fragment shaders unless the user explicitly asks for vertex distortion.
+
         CURRENT WORKSPACE:
         \(context)
 
@@ -484,16 +501,41 @@ actor AIService {
         Available shapes: "Rectangle", "Rounded Rect", "Circle", "Capsule"
         Position: normalized coords (-1 to 1), Scale: fraction of viewport (0.1 to 1.0)
 
-        4) Modify an existing 2D object's properties:
-        { "type": "modifyObject2D", "targetObjectName": "Button", "name": "New Name",
+        4) Modify an existing AI preview object's properties:
+        { "type": "modifyObject2D", "targetObjectName": "AI: Button", "name": "New Name",
           "shapeType": "Circle", "posX": 0.2, "posY": -0.1, "scaleW": 0.3, "scaleH": 0.3, "cornerRadius": 0.1 }
         Only include fields you want to change.
+        ⚠️ modifyObject2D is ONLY allowed on AI preview objects (names starting with "AI: ").
+        It is BLOCKED on user-created objects. To modify a user object, use setObjectShader2D
+        which automatically creates a non-destructive preview clone.
 
-        5) Set the shared distortion (vertex) or fragment shader:
-        { "type": "setSharedShader2D", "category": "distortion|fragment", "code": "shader code" }
+        5) Set per-object custom shader (PREFERRED for 2D effects):
+        { "type": "setObjectShader2D", "category": "fragment", "targetObjectName": "Button", "code": "shader code" }
+        ALWAYS target the user's original object name (e.g. "Button", not "AI: Button").
+        The system automatically creates a new AI preview clone — the user's original is NEVER modified.
+        When iterating on a previous result, the system clones from your latest preview version.
+        ⚠️ In 2D mode, ONLY write fragment shaders. Do NOT write distortion/vertex shaders for objects
+        unless the user explicitly asks for vertex distortion.
 
-        6) Set per-object custom shader:
-        { "type": "setObjectShader2D", "category": "distortion|fragment", "targetObjectName": "Button", "code": "shader code" }
+        6) Request shape lock (to enable SDF access for edge-aware effects):
+        { "type": "requestShapeLock", "targetObjectName": "Button", "name": "Reason for needing SDF access", "category": "", "code": "" }
+        This asks the user to lock the object's current shape. Once approved, `_sdf_shape()` becomes
+        callable in that object's custom fragment shader. The user will not be able to change the
+        object's shape type after locking. Use this ONLY when the effect truly requires distance-to-edge
+        information (e.g. edge glow, inner shadow, shape-contour gradients, frosted glass with edge falloff).
+        IMPORTANT: You MUST send requestShapeLock in a SEPARATE response BEFORE writing any shader code
+        that calls _sdf_shape(). Wait for user confirmation first. Do NOT combine requestShapeLock with
+        setObjectShader2D in the same response.
+
+        ═══ CRITICAL: USER CONTENT PROTECTION ═══
+        ✗ NEVER modify user-created objects. All your work goes into AI preview clones.
+        ✗ NEVER use setSharedShader2D — it changes the global shared shader affecting ALL user objects.
+        ✗ NEVER use modifyObject2D on user objects — it is blocked by the system.
+        ✗ NEVER use setObjectShader2D with category "distortion"/"vertex" unless the user explicitly
+          requests vertex/distortion effects. Default to "fragment" only.
+        ✓ ALWAYS target the original user object name in setObjectShader2D. The system handles cloning.
+        ✓ Each setObjectShader2D call creates a NEW preview clone. Previous versions remain intact
+          for the user to compare.
 
         CURRENT WORKSPACE (2D Mode):
         \(context)
@@ -519,6 +561,23 @@ actor AIService {
         - SDF edge clipping is applied automatically — just output the color.
         - Available VertexOut fields: in.texCoord (float2, shape-local UV [0,1])
         - Available uniforms: .resolution (float2), .time (float), .mouseX/.mouseY (float)
+
+        SDF ACCESS (shape-locked objects only):
+        When an object's shape is locked (see context: "[SHAPE LOCKED — SDF access enabled]"),
+        the system-provided function `_sdf_shape(float2 uv, float aspect, float cornerR)` is
+        available inside that object's custom fragment shader. It returns the signed distance to
+        the shape boundary: negative = inside, zero = edge, positive = outside.
+        Typical call: float d = _sdf_shape(in.texCoord, in.shapeAspect, in.cornerRadius);
+        Use this for edge glow, inner shadow, contour gradients, distance-based effects.
+        NEVER define your own SDF function or UV-based edge approximation — always use
+        _sdf_shape() which matches the exact shape geometry (including the G∞-continuous
+        squircle which CANNOT be approximated by standard rounded-rect or UV-distance formulas).
+        If an object's shape is NOT locked but the effect needs edge distance, you MUST:
+          1. Send ONLY a requestShapeLock action in this response (no shader code at all)
+          2. In your explanation, tell the user why the shape lock is needed
+          3. Do NOT attempt to write shader code that computes edge distance without the lock
+        After the user approves, the context will show "[SHAPE LOCKED]" and you can then
+        write the shader using _sdf_shape() in a follow-up response.
 
         BACKGROUND TEXTURE (bgTexture) — for glass, blur, refraction effects:
         - To read the canvas behind this object (grid + previously drawn objects),
@@ -564,6 +623,7 @@ actor AIService {
         ✓ Time-animated and mouse-interactive effects
         ✓ User-controllable parameters via @param directives (ALWAYS use these)
         ✓ Background pixel sampling via bgTexture — frosted glass, blur, refraction, distortion, see-through effects
+        ✓ Edge-aware effects via _sdf_shape() (requires shape lock — use requestShapeLock first)
 
         LIMITATIONS (canFulfill = false, explain barriers):
         ✗ External texture / image sampling (only bgTexture for the canvas background is available)
@@ -586,11 +646,31 @@ actor AIService {
         ✗ DO NOT embed base64 data, bitmap patterns, or lookup tables that represent specific images.
         ✗ DO NOT write shader code that only works for one specific object shape or screen position.
         ✗ DO NOT attempt to recreate/reproduce a background grid, image, or UI element by drawing it in the shader.
+
+        EDGE / BOUNDARY DISTANCE — CRITICAL RULE:
+        ✗ DO NOT compute distance-to-edge using ANY method without a shape lock.
+          This includes ALL of the following (non-exhaustive):
+          - Writing your own SDF functions (circle, box, rounded rect, etc.)
+          - UV-distance approximations: abs(uv - 0.5), length(uv - 0.5), max(abs(p.x), abs(p.y))
+          - "edgeDist", "rim", "border", "contour" computed from UV coordinates
+          - Smoothstep/falloff based on UV distance to 0.0 or 1.0 boundaries
+          ALL of these are WRONG for non-rectangular shapes (especially the squircle/G∞ rounded rect).
+        The ONLY correct way to obtain distance-to-shape-boundary is:
+          float d = _sdf_shape(in.texCoord, in.shapeAspect, in.cornerRadius);
+        This function is ONLY available after a shape lock. If the user's request involves ANY
+        of these effects: edge glow, rim light, inner shadow, border, edge-based refraction,
+        frosted glass with edge falloff, thickness simulation, contour gradient — you MUST:
+          1. First send a requestShapeLock action (in its own response, no shader code)
+          2. Wait for user approval
+          3. Only THEN write shader code using _sdf_shape()
+        If you are unsure whether an effect needs edge distance, it probably does — request the lock.
+
         Shaders MUST be generic and portable — they must produce correct results on ANY shape,
         ANY size, ANY position. Use normalized coordinates (UV, screenUV) and relative values.
-        The purpose of this shader canvas is prototyping effects that apply to arbitrary geometry.
+        EXCEPTION: when an object's shape is locked, its per-object shader may use _sdf_shape()
+        which is inherently shape-specific. This is acceptable because the shape lock makes the
+        dependency explicit. Shared shaders (setSharedShader2D) must NEVER use _sdf_shape().
         If the user wants to see the background through an object, use bgTexture with screenUV sampling.
-        If the user wants edge effects, use the object's SDF/UV boundaries — not hardcoded coordinates.
 
         IMPORTANT:
         - All generated shader code MUST compile. Verify mentally before outputting.

@@ -297,6 +297,7 @@ struct MetalView: NSViewRepresentable {
         private var cached2DObjectIDs: [UUID] = []
         private var cached2DObjectShapes: [Shape2DType] = []
         private var cached2DObjectCodes: [String] = []
+        private var cached2DObjectLocked: [Bool] = []
         private var cached2DSharedVS: String = ""
         private var cached2DSharedFS: String = ""
         private var cached2DDataFlow: DataFlow2DConfig?
@@ -308,6 +309,7 @@ struct MetalView: NSViewRepresentable {
             for (i, obj) in objects.enumerated() {
                 if obj.id != cached2DObjectIDs[i] { return true }
                 if obj.shapeType != cached2DObjectShapes[i] { return true }
+                if obj.shapeLocked != cached2DObjectLocked[i] { return true }
                 let code = (obj.customVertexCode ?? "") + "|" + (obj.customFragmentCode ?? "")
                 if code != cached2DObjectCodes[i] { return true }
             }
@@ -318,6 +320,7 @@ struct MetalView: NSViewRepresentable {
             cached2DObjectIDs = objects.map(\.id)
             cached2DObjectShapes = objects.map(\.shapeType)
             cached2DObjectCodes = objects.map { ($0.customVertexCode ?? "") + "|" + ($0.customFragmentCode ?? "") }
+            cached2DObjectLocked = objects.map(\.shapeLocked)
             cached2DSharedVS = sharedVS
             cached2DSharedFS = sharedFS
             cached2DDataFlow = dataFlow2D

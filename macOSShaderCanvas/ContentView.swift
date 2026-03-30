@@ -140,6 +140,16 @@ struct ContentView: View {
     @State private var isAIChatActive = false
     @State private var chatMessages: [ChatMessage] = []
 
+    // MARK: - Shape Lock State
+
+    @State private var showingShapeLockAlert = false
+    @State private var pendingShapeLockObjectName = ""
+    @State private var pendingShapeLockExplanation = ""
+    /// Object names whose shape-lock was approved by the user.  Consumed when
+    /// the AI preview clone is created — the lock is applied to the clone, not
+    /// the original.
+    @State private var approvedShapeLocks: Set<String> = []
+
     // MARK: - Data Flow State
     
     /// Configurable vertex data fields shared across all mesh shaders (3D).
@@ -172,6 +182,118 @@ struct ContentView: View {
     // MARK: - Body
 
     var body: some View {
+        canvasMainLayout
+            .modifier(CanvasLifecycleModifier(
+                canvasMode: appState.canvasMode,
+                openFileURL: appState.openFileURL,
+                onInit: { mode, url in
+                    canvasMode = mode
+                    if let url { openCanvas(from: url) }
+                },
+                onNewCanvas: { showingNewCanvasConfirm = true },
+                onSave: { performSave() },
+                onSaveAs: { performSaveAs() },
+                onOpen: { performOpen() },
+                onTutorial: { startTutorial() },
+                onSettings: { showingAISettings = true },
+                onChat: { withAnimation(.easeInOut(duration: 0.3)) { isAIChatActive.toggle() } },
+                onBackToHub: { requestNavigateBackToHub() },
+                onCompilationResult: { error in
+                    withAnimation(.easeInOut(duration: 0.2)) { compilationError = error }
+                },
+                onObjectSelected: { id in selectedObjectID = id },
+                onObjectMoved: { id, x, y in
+                    if let idx = objects2D.firstIndex(where: { $0.id == id }) {
+                        objects2D[idx].posX = x; objects2D[idx].posY = y
+                    }
+                },
+                onZoomChanged: { z in canvasZoom = z },
+                onPanChanged: { p in canvasPan = p }
+            ))
+            .onChange(of: activeShaders) { hasUnsavedChanges = true }
+            .onChange(of: objects2D) { hasUnsavedChanges = true }
+            .onChange(of: paramValues) { hasUnsavedChanges = true }
+            .onChange(of: canvasName) { hasUnsavedChanges = true }
+            .onChange(of: dataFlowConfig) { hasUnsavedChanges = true }
+            .onChange(of: dataFlow2DConfig) { hasUnsavedChanges = true }
+            .onChange(of: sharedVertexCode2D) { hasUnsavedChanges = true }
+            .onChange(of: sharedFragmentCode2D) { hasUnsavedChanges = true }
+            .fileImporter(
+                isPresented: $fileImporterPresented,
+                allowedContentTypes: fileImporterContentTypes,
+                allowsMultipleSelection: false
+            ) { result in
+                if case .success(let urls) = result, let url = urls.first {
+                    _ = url.startAccessingSecurityScopedResource()
+                    switch fileImporterMode {
+                    case .mesh:
+                        meshType = .custom(url)
+                        customFileName = url.lastPathComponent
+                    case .background:
+                        if let image = NSImage(contentsOf: url) {
+                            backgroundImage = image
+                        }
+                    }
+                }
+            }
+    }
+
+    /// Alerts and sheets separated from body to reduce type-checker pressure.
+    @ViewBuilder
+    private var canvasAlerts: some View { EmptyView() }
+
+    private var canvasMainLayout: some View {
+        canvasMainZStack
+            .frame(minWidth: 800, minHeight: 600)
+            .alert("New Canvas", isPresented: $showingNewCanvasConfirm) {
+                Button("Save & Create New", role: nil) {
+                    performSave()
+                    resetToNewCanvas()
+                }
+                Button("Discard & Create New", role: .destructive) {
+                    resetToNewCanvas()
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Current canvas may have unsaved changes.")
+            }
+            .alert(String(localized: "Back to Hub"), isPresented: $showingBackToHubConfirm) {
+                Button(String(localized: "Save & Return"), role: nil) {
+                    performSave()
+                    navigateBackToHub()
+                }
+                Button(String(localized: "Discard & Return"), role: .destructive) {
+                    navigateBackToHub()
+                }
+                Button(String(localized: "Cancel"), role: .cancel) {}
+            } message: {
+                Text("You have unsaved changes. Returning to Hub will discard your current progress.")
+            }
+            .alert(String(localized: "Lock Shape"), isPresented: $showingShapeLockAlert) {
+                Button(String(localized: "Lock"), role: nil) {
+                    if canvasMode.is2D {
+                        approvedShapeLocks.insert(pendingShapeLockObjectName)
+                    } else if let idx = objects2D.firstIndex(where: { $0.name == pendingShapeLockObjectName }) {
+                        objects2D[idx].shapeLocked = true
+                    }
+                    NotificationCenter.default.post(name: .shapeLockResolved, object: true)
+                }
+                Button(String(localized: "Deny"), role: .cancel) {
+                    NotificationCenter.default.post(name: .shapeLockResolved, object: false)
+                }
+            } message: {
+                if let obj = objects2D.first(where: { $0.name == pendingShapeLockObjectName }) {
+                    Text("AI requests SDF access for \"\(pendingShapeLockObjectName)\" (\(obj.shapeType.rawValue)). Locking the shape enables edge-aware effects but prevents shape changes.")
+                } else {
+                    Text(pendingShapeLockExplanation)
+                }
+            }
+            .sheet(isPresented: $showingAISettings) {
+                AISettingsView(settings: aiSettings)
+            }
+    }
+
+    private var canvasMainZStack: some View {
         ZStack {
             // Layer 0: Metal rendering viewport (fills the entire window).
             MetalView(activeShaders: activeShaders, meshType: meshType, backgroundImage: backgroundImage, dataFlowConfig: dataFlowConfig, dataFlow2DConfig: dataFlow2DConfig, paramValues: paramValues, rotationAngle: Float(rotationAngle), canvasMode: canvasMode, objects2D: objects2D, sharedVertexCode2D: sharedVertexCode2D, sharedFragmentCode2D: sharedFragmentCode2D, canvasZoom: canvasZoom, canvasPan: canvasPan, shape2DType: shape2DType)
@@ -575,6 +697,8 @@ struct ContentView: View {
                     .transition(.opacity)
             }
 
+            
+
             // Undo delete toast notification (bottom center).
             if showUndoToast, let deleted = lastDeletedShader {
                 VStack {
@@ -613,115 +737,6 @@ struct ContentView: View {
                 .zIndex(4)
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             }
-        }
-        .frame(minWidth: 800, minHeight: 600)
-        .onAppear {
-            canvasMode = appState.canvasMode
-            if let url = appState.openFileURL {
-                openCanvas(from: url)
-            }
-        }
-        .onChange(of: activeShaders) { hasUnsavedChanges = true }
-        .onChange(of: objects2D) { hasUnsavedChanges = true }
-        .onChange(of: paramValues) { hasUnsavedChanges = true }
-        .onChange(of: canvasName) { hasUnsavedChanges = true }
-        .onChange(of: dataFlowConfig) { hasUnsavedChanges = true }
-        .onChange(of: dataFlow2DConfig) { hasUnsavedChanges = true }
-        .onChange(of: sharedVertexCode2D) { hasUnsavedChanges = true }
-        .onChange(of: sharedFragmentCode2D) { hasUnsavedChanges = true }
-        .onReceive(NotificationCenter.default.publisher(for: .canvasNew)) { _ in
-            showingNewCanvasConfirm = true
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .canvasSave)) { _ in
-            performSave()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .canvasSaveAs)) { _ in
-            performSaveAs()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .canvasOpen)) { _ in
-            performOpen()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .canvasTutorial)) { _ in
-            startTutorial()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .aiSettings)) { _ in
-            showingAISettings = true
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .aiChat)) { _ in
-            withAnimation(.easeInOut(duration: 0.3)) { isAIChatActive.toggle() }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .backToHub)) { _ in
-            requestNavigateBackToHub()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .shaderCompilationResult)) { notification in
-            withAnimation(.easeInOut(duration: 0.2)) {
-                compilationError = notification.object as? String
-            }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .canvas2DObjectSelected)) { notification in
-            selectedObjectID = notification.object as? UUID
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .canvas2DObjectMoved)) { notification in
-            guard let arr = notification.object as? [Any],
-                  let objID = arr[0] as? UUID,
-                  let px = arr[1] as? Float,
-                  let py = arr[2] as? Float,
-                  let idx = objects2D.firstIndex(where: { $0.id == objID }) else { return }
-            objects2D[idx].posX = px
-            objects2D[idx].posY = py
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .canvas2DZoomChanged)) { notification in
-            if let z = notification.object as? Float { canvasZoom = z }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .canvas2DPanChanged)) { notification in
-            if let arr = notification.object as? [Float], arr.count >= 2 {
-                canvasPan = simd_float2(arr[0], arr[1])
-            }
-        }
-        .fileImporter(
-            isPresented: $fileImporterPresented,
-            allowedContentTypes: fileImporterContentTypes,
-            allowsMultipleSelection: false
-        ) { result in
-            if case .success(let urls) = result, let url = urls.first {
-                _ = url.startAccessingSecurityScopedResource()
-                switch fileImporterMode {
-                case .mesh:
-                    meshType = .custom(url)
-                    customFileName = url.lastPathComponent
-                case .background:
-                    if let image = NSImage(contentsOf: url) {
-                        backgroundImage = image
-                    }
-                }
-            }
-        }
-        .alert("New Canvas", isPresented: $showingNewCanvasConfirm) {
-            Button("Save & Create New", role: nil) {
-                performSave()
-                resetToNewCanvas()
-            }
-            Button("Discard & Create New", role: .destructive) {
-                resetToNewCanvas()
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("Current canvas may have unsaved changes.")
-        }
-        .alert(String(localized: "Back to Hub"), isPresented: $showingBackToHubConfirm) {
-            Button(String(localized: "Save & Return"), role: nil) {
-                performSave()
-                navigateBackToHub()
-            }
-            Button(String(localized: "Discard & Return"), role: .destructive) {
-                navigateBackToHub()
-            }
-            Button(String(localized: "Cancel"), role: .cancel) {}
-        } message: {
-            Text("You have unsaved changes. Returning to Hub will discard your current progress.")
-        }
-        .sheet(isPresented: $showingAISettings) {
-            AISettingsView(settings: aiSettings)
         }
     }
 
@@ -829,94 +844,31 @@ struct ContentView: View {
     /// After executing all actions, re-sorts the layer list by category and
     /// opens the shader editor for the first affected layer (3D) or selects
     /// the first affected object (2D).
+    ///
+    /// `requestShapeLock` actions trigger a confirmation alert rather than
+    /// executing immediately.
     private func executeAgentActions(_ actions: [AgentAction]) {
-        var firstAffectedShaderID: UUID?
-        var firstAffectedObjectID: UUID?
+        let result = CanvasActions.executeAgentActions(
+            actions,
+            activeShaders: &activeShaders,
+            objects2D: &objects2D,
+            sharedVertexCode2D: &sharedVertexCode2D,
+            sharedFragmentCode2D: &sharedFragmentCode2D,
+            usePreviewClone: canvasMode.is2D,
+            approvedShapeLocks: &approvedShapeLocks
+        )
 
-        for action in actions {
-            switch action.type {
-            case .addLayer:
-                guard let category = action.shaderCategory else { continue }
-                let shader = ActiveShader(category: category, name: action.name, code: action.code)
-                activeShaders.append(shader)
-                if firstAffectedShaderID == nil { firstAffectedShaderID = shader.id }
-
-            case .modifyLayer:
-                if let targetName = action.targetLayerName,
-                   let index = activeShaders.firstIndex(where: { $0.name == targetName }) {
-                    activeShaders[index].code = action.code
-                    if !action.name.isEmpty && action.name != "Untitled" {
-                        activeShaders[index].name = action.name
-                    }
-                    if firstAffectedShaderID == nil { firstAffectedShaderID = activeShaders[index].id }
-                }
-
-            case .addObject2D:
-                let obj = Object2D(
-                    name: action.name,
-                    shapeType: action.shape2DType ?? .roundedRectangle,
-                    posX: action.posX ?? 0,
-                    posY: action.posY ?? 0,
-                    scaleW: action.scaleW ?? 0.5,
-                    scaleH: action.scaleH ?? 0.5,
-                    rotation: action.rotation ?? 0,
-                    cornerRadius: action.cornerRadius ?? 0.15
-                )
-                objects2D.append(obj)
-                if firstAffectedObjectID == nil { firstAffectedObjectID = obj.id }
-
-            case .modifyObject2D:
-                let targetName = action.targetObjectName ?? action.name
-                if let index = objects2D.firstIndex(where: { $0.name == targetName }) {
-                    if !action.name.isEmpty && action.name != "Untitled" {
-                        objects2D[index].name = action.name
-                    }
-                    if let shape = action.shape2DType { objects2D[index].shapeType = shape }
-                    if let x = action.posX { objects2D[index].posX = x }
-                    if let y = action.posY { objects2D[index].posY = y }
-                    if let w = action.scaleW { objects2D[index].scaleW = w }
-                    if let h = action.scaleH { objects2D[index].scaleH = h }
-                    if let r = action.rotation { objects2D[index].rotation = r }
-                    if let cr = action.cornerRadius { objects2D[index].cornerRadius = cr }
-                    if firstAffectedObjectID == nil { firstAffectedObjectID = objects2D[index].id }
-                }
-
-            case .setSharedShader2D:
-                switch action.category.lowercased() {
-                case "distortion", "vertex":
-                    sharedVertexCode2D = action.code
-                case "fragment":
-                    sharedFragmentCode2D = action.code
-                default:
-                    break
-                }
-
-            case .setObjectShader2D:
-                let targetName = action.targetObjectName ?? action.name
-                if let index = objects2D.firstIndex(where: { $0.name == targetName }) {
-                    switch action.category.lowercased() {
-                    case "distortion", "vertex":
-                        objects2D[index].customVertexCode = action.code.isEmpty ? nil : action.code
-                    case "fragment":
-                        objects2D[index].customFragmentCode = action.code.isEmpty ? nil : action.code
-                    default:
-                        break
-                    }
-                    if firstAffectedObjectID == nil { firstAffectedObjectID = objects2D[index].id }
-                }
-            }
+        if let req = result.shapeLockRequests.first {
+            pendingShapeLockObjectName = req.objectName
+            pendingShapeLockExplanation = req.explanation
+            showingShapeLockAlert = true
         }
 
-        activeShaders.sort { s1, s2 in
-            let order: [ShaderCategory: Int] = [.vertex: 0, .fragment: 1, .fullscreen: 2]
-            return order[s1.category]! < order[s2.category]!
-        }
-
-        if let id = firstAffectedShaderID {
+        if let id = result.firstShaderID {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
                 withAnimation { editingShaderID = id }
             }
-        } else if let id = firstAffectedObjectID {
+        } else if let id = result.firstObjectID {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
                 withAnimation { selectedObjectID = id }
             }
@@ -1223,10 +1175,19 @@ struct ContentView: View {
                                 HStack {
                                     Image(systemName: object.shapeType.icon)
                                         .foregroundColor(selectedObjectID == object.id ? .blue : .white.opacity(0.6))
+
+                                    if object.isAIPreview {
+                                        Text("AI").font(.system(size: 9, weight: .bold))
+                                            .padding(.horizontal, 4).padding(.vertical, 1)
+                                            .background(Color.purple.opacity(0.6))
+                                            .cornerRadius(3)
+                                    }
+
                                     Text(object.name)
-                                        .foregroundColor(.white)
+                                        .foregroundColor(object.isAIPreview ? .purple.opacity(0.9) : .white)
                                         .lineLimit(1)
                                     Spacer()
+
                                     Button(action: { removeObject2D(object.id) }) {
                                         Image(systemName: "xmark.circle.fill")
                                     }
@@ -1234,7 +1195,11 @@ struct ContentView: View {
                                     .foregroundColor(.red.opacity(0.7))
                                 }
                                 .padding(8)
-                                .background(selectedObjectID == object.id ? Color.blue.opacity(0.2) : Color.black.opacity(0.4))
+                                .background(
+                                    selectedObjectID == object.id
+                                        ? Color.blue.opacity(0.2)
+                                        : object.isAIPreview ? Color.purple.opacity(0.1) : Color.black.opacity(0.4)
+                                )
                                 .cornerRadius(6)
                                 .contentShape(Rectangle())
                                 .onTapGesture { selectedObjectID = object.id }
@@ -1301,6 +1266,19 @@ struct ContentView: View {
             // Shape selection
             HStack(spacing: 4) {
                 Text("Shape").font(.caption).foregroundColor(.white.opacity(0.6))
+                if objects2D[idx].shapeLocked {
+                    Image(systemName: "lock.fill").font(.system(size: 9))
+                        .foregroundColor(.orange.opacity(0.8))
+                        .help(String(localized: "Shape locked — SDF access enabled for this object's shader"))
+                    Button(action: {
+                        objects2D[idx].shapeLocked = false
+                    }) {
+                        Image(systemName: "lock.open").font(.system(size: 9))
+                            .foregroundColor(.orange.opacity(0.6))
+                    }
+                    .buttonStyle(.plain)
+                    .help(String(localized: "Unlock shape (may break edge-aware shader effects)"))
+                }
                 Spacer()
                 ForEach(Shape2DType.allCases) { shape in
                     Button(action: { objects2D[idx].shapeType = shape }) {
@@ -1308,6 +1286,7 @@ struct ContentView: View {
                             .foregroundColor(objects2D[idx].shapeType == shape ? .blue : .white.opacity(0.5))
                     }
                     .buttonStyle(.plain)
+                    .disabled(objects2D[idx].shapeLocked)
                 }
             }
 
@@ -2135,6 +2114,9 @@ struct ShaderEditorView: View {
 extension NSNotification.Name {
     static let insertSnippet = NSNotification.Name("insertSnippet")
     static let shaderCompilationResult = NSNotification.Name("shaderCompilationResult")
+    /// Posted when the user responds to a shape-lock permission dialog.
+    /// `object` is `true` (approved) or `false` (denied).
+    static let shapeLockResolved = NSNotification.Name("shapeLockResolved")
 }
 
 // MARK: - Code Editor (NSViewRepresentable)
@@ -2515,6 +2497,63 @@ struct ObjectCustomShaderEditorView: View {
         }
         .background(Color.black.opacity(0.85))
         .cornerRadius(10)
+    }
+}
+
+// MARK: - ContentView Helper Modifiers
+
+/// Extracts all NotificationCenter receivers and onAppear into a single
+/// modifier to reduce type-checker load on ContentView.body.
+private struct CanvasLifecycleModifier: ViewModifier {
+    let canvasMode: CanvasMode
+    let openFileURL: URL?
+    let onInit: (CanvasMode, URL?) -> Void
+    let onNewCanvas: () -> Void
+    let onSave: () -> Void
+    let onSaveAs: () -> Void
+    let onOpen: () -> Void
+    let onTutorial: () -> Void
+    let onSettings: () -> Void
+    let onChat: () -> Void
+    let onBackToHub: () -> Void
+    let onCompilationResult: (String?) -> Void
+    let onObjectSelected: (UUID?) -> Void
+    let onObjectMoved: (UUID, Float, Float) -> Void
+    let onZoomChanged: (Float) -> Void
+    let onPanChanged: (simd_float2) -> Void
+
+    func body(content: Content) -> some View {
+        content
+            .onAppear { onInit(canvasMode, openFileURL) }
+            .onReceive(NotificationCenter.default.publisher(for: .canvasNew)) { _ in onNewCanvas() }
+            .onReceive(NotificationCenter.default.publisher(for: .canvasSave)) { _ in onSave() }
+            .onReceive(NotificationCenter.default.publisher(for: .canvasSaveAs)) { _ in onSaveAs() }
+            .onReceive(NotificationCenter.default.publisher(for: .canvasOpen)) { _ in onOpen() }
+            .onReceive(NotificationCenter.default.publisher(for: .canvasTutorial)) { _ in onTutorial() }
+            .onReceive(NotificationCenter.default.publisher(for: .aiSettings)) { _ in onSettings() }
+            .onReceive(NotificationCenter.default.publisher(for: .aiChat)) { _ in onChat() }
+            .onReceive(NotificationCenter.default.publisher(for: .backToHub)) { _ in onBackToHub() }
+            .onReceive(NotificationCenter.default.publisher(for: .shaderCompilationResult)) { n in
+                onCompilationResult(n.object as? String)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .canvas2DObjectSelected)) { n in
+                onObjectSelected(n.object as? UUID)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .canvas2DObjectMoved)) { n in
+                guard let arr = n.object as? [Any],
+                      let id = arr[0] as? UUID,
+                      let px = arr[1] as? Float,
+                      let py = arr[2] as? Float else { return }
+                onObjectMoved(id, px, py)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .canvas2DZoomChanged)) { n in
+                if let z = n.object as? Float { onZoomChanged(z) }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .canvas2DPanChanged)) { n in
+                if let arr = n.object as? [Float], arr.count >= 2 {
+                    onPanChanged(simd_float2(arr[0], arr[1]))
+                }
+            }
     }
 }
 

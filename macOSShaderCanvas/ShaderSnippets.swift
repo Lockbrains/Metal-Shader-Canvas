@@ -1416,7 +1416,12 @@ struct ShaderSnippets {
     ///
     /// If the user's code references `bgTexture`, the background texture is passed
     /// through to `_user_fragment` so it can sample the canvas behind the object.
-    static func wrapFragmentWithSDF(userCode: String, shape: Shape2DType, hasParams: Bool) -> String {
+    ///
+    /// When `sdfAccessEnabled` is true, `_sdf_shape()` is defined **before** the
+    /// user's code so it can be called from `_user_fragment`. This is gated behind
+    /// the shape-lock feature: the object's shape must be locked before the AI can
+    /// generate code that references `_sdf_shape()`.
+    static func wrapFragmentWithSDF(userCode: String, shape: Shape2DType, hasParams: Bool, sdfAccessEnabled: Bool = false) -> String {
         let usesBgTexture = userCode.contains("bgTexture")
 
         var code = userCode
@@ -1453,13 +1458,19 @@ struct ShaderSnippets {
         }
 
         let sdfBody = sdfFunction(for: shape)
-        code += """
+        let sdfFunc = """
 
         float _sdf_shape(float2 uv, float aspect, float cornerR) {
             \(sdfBody)
         }
 
         """
+
+        if sdfAccessEnabled {
+            code = sdfFunc + code
+        } else {
+            code += sdfFunc
+        }
 
         // Build the wrapper's parameter list and the call arguments.
         // bgTexture is always declared (since the renderer always binds it),

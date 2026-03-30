@@ -388,16 +388,6 @@ struct ReferenceBoard: View {
 
 extension NSImage {
     func jpegThumbnail(maxSize: CGFloat) -> Data? {
-        let ratio = min(maxSize / size.width, maxSize / size.height, 1.0)
-        let newSize = NSSize(width: size.width * ratio, height: size.height * ratio)
-        let resized = NSImage(size: newSize)
-        resized.lockFocus()
-        draw(in: NSRect(origin: .zero, size: newSize),
-             from: NSRect(origin: .zero, size: size),
-             operation: .copy, fraction: 1.0)
-        resized.unlockFocus()
-        guard let tiff = resized.tiffRepresentation,
-              let bitmap = NSBitmapImageRep(data: tiff) else { return nil }
-        return bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.7])
+        MetalRenderer.resizeAndCompress(self, maxDimension: Int(maxSize), quality: 0.7)
     }
 }

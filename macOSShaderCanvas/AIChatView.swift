@@ -257,16 +257,15 @@ struct AIChatView: View {
             AITutorialPromptView(topic: $tutorialTopic, isLoading: $isTutorialLoading, onGenerate: { generateTutorial() })
         }
         .onChange(of: compilationError) { _, newError in
-            guard pendingAutoFix, let error = newError, autoFixAttempts < maxAutoFixAttempts else {
-                if pendingAutoFix && compilationError == nil {
-                    pendingAutoFix = false
-                    autoFixAttempts = 0
-                }
-                return
+            guard pendingAutoFix else { return }
+            if let error = newError, autoFixAttempts < maxAutoFixAttempts {
+                pendingAutoFix = false
+                autoFixAttempts += 1
+                autoFixCompilationError(error)
+            } else {
+                pendingAutoFix = false
+                if compilationError == nil { autoFixAttempts = 0 }
             }
-            pendingAutoFix = false
-            autoFixAttempts += 1
-            autoFixCompilationError(error)
         }
     }
 
@@ -499,12 +498,22 @@ struct AIChatView: View {
     /// the race condition where compilation finishes before we start listening.
     /// After `onAgentActions` modifies state, SwiftUI's next `updateNSView` triggers
     /// `compileObject2DPipelines()` / `compileMeshPipeline()`, which posts the result.
+    ///
+    /// **Shape-lock gate**: If the actions contain a `requestShapeLock`, the plan
+    /// pauses and waits for the user to approve or deny via the system alert.
+    /// Only after approval does the plan proceed to the next step where the AI
+    /// can generate shader code that references `_sdf_shape()`.
     private func applyActionsAndCheckCompilation(_ actions: [AgentAction]) async -> String? {
-        await withCheckedContinuation { cont in
+        let hasShapeLock = actions.contains { $0.type == .requestShapeLock }
+
+        if hasShapeLock {
+            return await waitForShapeLockApproval(actions: actions)
+        }
+
+        return await withCheckedContinuation { cont in
             let once = OnceGuard()
             var observer: NSObjectProtocol?
 
-            // 1. Install listener FIRST — before any state changes
             observer = NotificationCenter.default.addObserver(
                 forName: .shaderCompilationResult, object: nil, queue: .main
             ) { notification in
@@ -513,14 +522,38 @@ struct AIChatView: View {
                 cont.resume(returning: notification.object as? String)
             }
 
-            // 2. Apply actions (triggers compilation via SwiftUI update cycle)
             onAgentActions(actions)
 
-            // 3. Timeout fallback — 5 seconds is enough for any compilation
-            DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 10.0) {
                 guard once.tryOnce() else { return }
                 if let obs = observer { NotificationCenter.default.removeObserver(obs) }
                 cont.resume(returning: nil)
+            }
+        }
+    }
+
+    /// Waits for the user to approve/deny a shape-lock request before the plan
+    /// proceeds. Returns `nil` on approval, an error string on denial/timeout.
+    private func waitForShapeLockApproval(actions: [AgentAction]) async -> String? {
+        await withCheckedContinuation { cont in
+            let once = OnceGuard()
+            var observer: NSObjectProtocol?
+
+            observer = NotificationCenter.default.addObserver(
+                forName: .shapeLockResolved, object: nil, queue: .main
+            ) { notification in
+                guard once.tryOnce() else { return }
+                if let obs = observer { NotificationCenter.default.removeObserver(obs) }
+                let approved = notification.object as? Bool ?? false
+                cont.resume(returning: approved ? nil : "SHAPE_LOCK_DENIED")
+            }
+
+            onAgentActions(actions)
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 120.0) {
+                guard once.tryOnce() else { return }
+                if let obs = observer { NotificationCenter.default.removeObserver(obs) }
+                cont.resume(returning: "SHAPE_LOCK_DENIED")
             }
         }
     }
@@ -574,19 +607,9 @@ struct AIChatView: View {
     }
 
     /// Downscale and compress an image to JPEG for API submission.
+    /// Uses thread-safe CGContext instead of NSImage.lockFocus.
     private func compressForAI(_ image: NSImage, maxDimension: CGFloat = 1024) -> Data? {
-        let size = image.size
-        let scale = min(maxDimension / max(size.width, size.height), 1.0)
-        let newSize = NSSize(width: size.width * scale, height: size.height * scale)
-        let resized = NSImage(size: newSize)
-        resized.lockFocus()
-        image.draw(in: NSRect(origin: .zero, size: newSize),
-                   from: NSRect(origin: .zero, size: size),
-                   operation: .copy, fraction: 1.0)
-        resized.unlockFocus()
-        guard let tiff = resized.tiffRepresentation,
-              let rep = NSBitmapImageRep(data: tiff) else { return nil }
-        return rep.representation(using: .jpeg, properties: [.compressionFactor: 0.7])
+        MetalRenderer.resizeAndCompress(image, maxDimension: Int(maxDimension), quality: 0.7)
     }
 
     private func handleSubmit() {
@@ -597,18 +620,19 @@ struct AIChatView: View {
     private func sendPlanRequest() {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, aiSettings.isConfigured else { return }
-        let snapshot = MetalRenderer.current?.captureForAI()
         let userImg = pendingUserImage
         var userMsg = ChatMessage(role: .user, content: text)
-        userMsg.renderSnapshot = snapshot
         userMsg.userImage = userImg
         messages.append(userMsg)
+        let userMsgIdx = messages.count - 1
         inputText = ""; pendingUserImage = nil; isLoading = true; errorMessage = nil; streamingThinking = ""
         let context = buildContext()
         let dataFlowDesc = buildDataFlowDescription()
-        let combinedImage = userImg ?? snapshot
         let captured = aiSettings.captured
         Task {
+            let snapshot = await Task.detached { MetalRenderer.current?.captureForAI() }.value
+            messages[userMsgIdx].renderSnapshot = snapshot
+            let combinedImage = userImg ?? snapshot
             do {
                 // Phase 1: Stream plan generation — direct SSE, no actor crossings
                 let accumulated = await streamDirectSSE(
@@ -729,7 +753,7 @@ struct AIChatView: View {
 
         // Phase 1: Generate shader code (with streaming)
         do {
-            let snapshot = MetalRenderer.current?.captureForAI()
+            let snapshot = await Task.detached { MetalRenderer.current?.captureForAI() }.value
             let freshContext = await MainActor.run { buildContext() }
             let captured = await MainActor.run { aiSettings.captured }
 
@@ -778,8 +802,18 @@ struct AIChatView: View {
                 return StepResult(succeeded: true, handoff: nil)
             }
 
-            // Phase 2: Apply actions and await compilation
+            // Phase 2: Apply actions and await compilation (or shape-lock approval)
             let compError = await applyActionsAndCheckCompilation(response.actions)
+
+            if compError == "SHAPE_LOCK_DENIED" {
+                await MainActor.run {
+                    plan.nodes[i].status = .failed
+                    plan.nodes[i].error = "Shape lock denied by user"
+                    messages.append(ChatMessage(role: .assistant,
+                        content: "✗ \(stepTitle): Shape lock was denied — edge-aware effects require a locked shape."))
+                }
+                return StepResult(succeeded: false, handoff: nil)
+            }
 
             if let compError {
                 // Phase 3: Compilation failed — auto-fix loop
@@ -811,21 +845,43 @@ struct AIChatView: View {
             }
 
             // Phase 4: Compilation succeeded — visual verification
+            // In 2D mode with preview clones, capture ONLY the AI preview
+            // object so the multimodal model evaluates its own output in
+            // isolation rather than guessing which object is the AI's.
             try? await Task.sleep(for: .milliseconds(300))
-            let verifySnapshot = MetalRenderer.current?.captureForAI()
+
+            let previewTargetName: String? = canvasMode.is2D
+                ? response.actions
+                    .first(where: { $0.type == .setObjectShader2D })
+                    .map { "AI: \($0.targetObjectName ?? $0.name)" }
+                : nil
+
+            let previewObjectID: UUID? = previewTargetName.flatMap { name in
+                MetalRenderer.current?.objects2D
+                    .first(where: { $0.isAIPreview && $0.name == name })?.id
+            }
+
+            let verifySnapshot: Data? = await Task.detached {
+                if let pid = previewObjectID {
+                    return MetalRenderer.current?.capturePreviewObject(pid)
+                }
+                return MetalRenderer.current?.captureForAI()
+            }.value
             var verificationNote = ""
 
             if let verifyData = verifySnapshot {
                 let verifyContext = await MainActor.run { buildContext() }
+                let verifyHint = previewObjectID != nil
+                    ? "\nThe screenshot shows ONLY the AI-generated preview object rendered in isolation. Evaluate whether it matches the step goal."
+                    : ""
                 do {
                     let result = try await AIService.shared.verifyStepResult(
-                        stepTitle: stepTitle, stepDescription: stepDesc,
+                        stepTitle: stepTitle, stepDescription: stepDesc + verifyHint,
                         screenshot: verifyData, context: verifyContext,
                         canvasMode: canvasMode, settings: aiSettings
                     )
                     if !result.passed {
                         verificationNote = "\n⚠️ Visual check: \(result.feedback)"
-                        // Attempt a visual fix — re-execute with the feedback
                         let fixContext = await MainActor.run { buildContext() }
                         let fixHandoff = (handoffSummary ?? "") +
                             "\n\n--- VISUAL VERIFICATION FAILED ---\n\(result.feedback)\nPlease adjust the shader to fix the visual issue.\n"
@@ -961,7 +1017,7 @@ struct AIChatView: View {
             }
 
             let fixContext = await MainActor.run { buildContext() }
-            let snapshot = MetalRenderer.current?.captureForAI()
+            let snapshot = await Task.detached { MetalRenderer.current?.captureForAI() }.value
 
             // Include error history so the AI doesn't repeat failed approaches
             let errorHistory = previousErrors.count > 1
@@ -1035,8 +1091,8 @@ struct AIChatView: View {
         isLoading = true; errorMessage = nil
         let context = buildContext()
         let dataFlowDesc = buildDataFlowDescription()
-        let snapshot = MetalRenderer.current?.captureForAI()
         Task {
+            let snapshot = await Task.detached { MetalRenderer.current?.captureForAI() }.value
             do {
                 let response = try await AIService.shared.agentChat(
                     messages: messages, context: context,
@@ -1163,12 +1219,13 @@ struct MessageBubble: View {
                 if let actions = message.executedActions, !actions.isEmpty {
                     VStack(alignment: .leading, spacing: 3) {
                         ForEach(Array(actions.enumerated()), id: \.offset) { _, action in
+                            let isLock = action.type == .requestShapeLock
                             HStack(spacing: 4) {
-                                Image(systemName: action.type == .addLayer ? "plus.circle.fill" : "pencil.circle.fill")
-                                    .foregroundColor(.green).font(.system(size: 11))
+                                Image(systemName: isLock ? "lock.fill" : (action.type == .addLayer ? "plus.circle.fill" : "pencil.circle.fill"))
+                                    .foregroundColor(isLock ? .orange : .green).font(.system(size: 11))
                                 Text(actionLabel(action))
                                     .font(.system(size: 11, weight: .medium))
-                                    .foregroundColor(.green.opacity(0.9))
+                                    .foregroundColor(isLock ? .orange.opacity(0.9) : .green.opacity(0.9))
                             }
                         }
                     }
@@ -1222,6 +1279,8 @@ struct MessageBubble: View {
             return "✓ Updated Shared \(action.category.capitalized) Shader"
         case .setObjectShader2D:
             return "✓ Set \(action.category.capitalized) on \"\(action.targetObjectName ?? action.name)\""
+        case .requestShapeLock:
+            return "🔒 Shape Lock Requested: \"\(action.targetObjectName ?? action.name)\""
         }
     }
 }

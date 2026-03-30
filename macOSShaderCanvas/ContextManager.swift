@@ -275,10 +275,13 @@ enum ContextManager {
             if objects2D.isEmpty {
                 ctx += "\nNo 2D objects on canvas.\n"
             } else {
-                ctx += "\n2D Objects (\(objects2D.count)):\n"
-                for obj in objects2D {
+                let userObjects = objects2D.filter { !$0.isAIPreview }
+                let previewObjects = objects2D.filter { $0.isAIPreview }
+                ctx += "\n2D Objects (\(userObjects.count)):\n"
+                for obj in userObjects {
                     let isSelected = obj.id == selectedObjectID
                     ctx += "  \(isSelected ? "▸" : "-") \"\(obj.name)\": shape=\(obj.shapeType.rawValue)"
+                    if obj.shapeLocked { ctx += " [SHAPE LOCKED — SDF access enabled]" }
                     ctx += ", pos=(\(String(format: "%.2f", obj.posX)), \(String(format: "%.2f", obj.posY)))"
                     ctx += ", scale=(\(String(format: "%.2f", obj.scaleW)), \(String(format: "%.2f", obj.scaleH)))"
                     if obj.rotation != 0 { ctx += ", rot=\(String(format: "%.1f", obj.rotation))°" }
@@ -287,12 +290,21 @@ enum ContextManager {
                     if isSelected { ctx += " ★SELECTED" }
                     ctx += "\n"
                 }
+                if !previewObjects.isEmpty {
+                    ctx += "\nAI Previews (pending user review, \(previewObjects.count)):\n"
+                    for obj in previewObjects {
+                        ctx += "  ⟐ \"\(obj.name)\": YOUR generated preview"
+                        ctx += ", shape=\(obj.shapeType.rawValue)"
+                        if obj.shapeLocked { ctx += " [LOCKED]" }
+                        ctx += "\n"
+                    }
+                }
             }
 
             // Prominently show the selected object's full shader details
             if let sel = selectedObj {
                 ctx += "\n=== SELECTED OBJECT: \"\(sel.name)\" (user is focused on this) ===\n"
-                ctx += "Shape: \(sel.shapeType.rawValue)\n"
+                ctx += "Shape: \(sel.shapeType.rawValue)\(sel.shapeLocked ? " [LOCKED — _sdf_shape() available]" : "")\n"
                 ctx += "Position: (\(String(format: "%.2f", sel.posX)), \(String(format: "%.2f", sel.posY)))\n"
                 ctx += "Scale: (\(String(format: "%.2f", sel.scaleW)), \(String(format: "%.2f", sel.scaleH)))\n"
                 if sel.rotation != 0 { ctx += "Rotation: \(String(format: "%.1f", sel.rotation))°\n" }

@@ -107,11 +107,23 @@ struct Object2D: Identifiable, Codable, Equatable {
     var cornerRadius: Float
     var customVertexCode: String?
     var customFragmentCode: String?
+    /// When true, the shape type is locked and `_sdf_shape()` is available
+    /// inside this object's custom fragment shader.
+    var shapeLocked: Bool
+
+    /// AI-preview objects are non-destructive clones created by the AI instead
+    /// of modifying the user's original.  The user reviews them and explicitly
+    /// accepts (replace original) or rejects (discard clone).
+    var isAIPreview: Bool
+    /// UUID of the original object this preview was cloned from.
+    var sourceObjectID: UUID?
 
     init(id: UUID = UUID(), name: String = "Object", shapeType: Shape2DType = .roundedRectangle,
          posX: Float = 0, posY: Float = 0, scaleW: Float = 0.5, scaleH: Float = 0.5,
          rotation: Float = 0, cornerRadius: Float = 0.15,
-         customVertexCode: String? = nil, customFragmentCode: String? = nil) {
+         customVertexCode: String? = nil, customFragmentCode: String? = nil,
+         shapeLocked: Bool = false,
+         isAIPreview: Bool = false, sourceObjectID: UUID? = nil) {
         self.id = id
         self.name = name
         self.shapeType = shapeType
@@ -123,6 +135,9 @@ struct Object2D: Identifiable, Codable, Equatable {
         self.cornerRadius = cornerRadius
         self.customVertexCode = customVertexCode
         self.customFragmentCode = customFragmentCode
+        self.shapeLocked = shapeLocked
+        self.isAIPreview = isAIPreview
+        self.sourceObjectID = sourceObjectID
     }
 
     init(from decoder: Decoder) throws {
@@ -138,6 +153,9 @@ struct Object2D: Identifiable, Codable, Equatable {
         cornerRadius = try container.decodeIfPresent(Float.self, forKey: .cornerRadius) ?? 0.15
         customVertexCode = try container.decodeIfPresent(String.self, forKey: .customVertexCode)
         customFragmentCode = try container.decodeIfPresent(String.self, forKey: .customFragmentCode)
+        shapeLocked = try container.decodeIfPresent(Bool.self, forKey: .shapeLocked) ?? false
+        isAIPreview = try container.decodeIfPresent(Bool.self, forKey: .isAIPreview) ?? false
+        sourceObjectID = try container.decodeIfPresent(UUID.self, forKey: .sourceObjectID)
     }
 }
 
@@ -561,6 +579,7 @@ struct StreamChunk {
 /// - `modifyObject2D`: change an existing Object2D's properties (position/scale/shape/etc.)
 /// - `setSharedShader2D`: set the shared distortion (vertex) or fragment code
 /// - `setObjectShader2D`: set per-object custom distortion or fragment code
+/// - `requestShapeLock`: request to lock an object's shape to gain SDF access
 enum AgentActionType: String, Codable {
     case addLayer
     case modifyLayer
@@ -568,6 +587,7 @@ enum AgentActionType: String, Codable {
     case modifyObject2D
     case setSharedShader2D
     case setObjectShader2D
+    case requestShapeLock
 }
 
 /// A single action the AI Agent wants to perform on the shader workspace.

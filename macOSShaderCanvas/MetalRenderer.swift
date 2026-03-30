@@ -183,6 +183,18 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     /// Per-object compiled pipeline (VS distort + FS color + SDF mask, single pass).
     var object2DPipelineStates: [UUID: MTLRenderPipelineState] = [:]
 
+    /// Serial queue for all Metal library compilation, preventing concurrent
+    /// `makeLibrary(source:)` calls that contend for the driver's file lock.
+    private let compileQueue = DispatchQueue(label: "com.shadercanvas.compile", qos: .userInitiated)
+    /// Monotonic counter incremented on each compilation request; stale results
+    /// whose generation doesn't match are discarded on the main thread.
+    private var compileGeneration: UInt64 = 0
+
+    /// Limits the number of in-flight GPU frames to prevent `view.currentDrawable`
+    /// from blocking the main thread when the Metal driver is in a degraded state
+    /// (e.g. after "Compiler failed to build request").
+    private let frameSemaphore = DispatchSemaphore(value: 3)
+
     /// Pipeline for the 2D grid background (compiled once).
     var gridPipelineState: MTLRenderPipelineState?
 
@@ -266,8 +278,9 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         self.depthStencilState = device.makeDepthStencilState(descriptor: depthDescriptor)
 
         // Build the default mesh and compile all initial pipelines.
+        // All init-time compilation runs synchronously through the serial
+        // queue to avoid flock contention with concurrent makeLibrary calls.
         setupMesh(type: currentMeshType)
-        compileMeshPipeline()
         compileBlitPipeline(metalView: metalView)
         compileBgBlitPipeline()
         compileGridPipeline()
@@ -394,24 +407,28 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     /// 3. For fragment: use user code (stripped of struct defs) or built-in default
     /// 4. Prepend header to both, compile, and create the pipeline
     func compileMeshPipeline() {
-        let vertexShaders = activeShaders.filter { $0.category == .vertex }
-        let fragmentShaders = activeShaders.filter { $0.category == .fragment }
-        
+        guard let dev = device else { return }
+        let shaders = activeShaders
+        let dfConfig = dataFlowConfig
+        let currentMesh = mesh
+
+        let vertexShaders = shaders.filter { $0.category == .vertex }
+        let fragmentShaders = shaders.filter { $0.category == .fragment }
+
         let vRawBody: String
         if let userVS = vertexShaders.last?.code {
             vRawBody = ShaderSnippets.stripStructDefinitions(from: userVS)
         } else {
-            vRawBody = ShaderSnippets.generateDefaultVertexShader(config: dataFlowConfig)
+            vRawBody = ShaderSnippets.generateDefaultVertexShader(config: dfConfig)
         }
-        
+
         let fRawBody: String
         if let userFS = fragmentShaders.last?.code {
             fRawBody = ShaderSnippets.stripStructDefinitions(from: userFS)
         } else {
             fRawBody = ShaderSnippets.defaultFragment
         }
-        
-        // Parse @param directives from all mesh shader sources
+
         var allParams: [ShaderParam] = []
         var seenNames = Set<String>()
         for shader in vertexShaders + fragmentShaders {
@@ -419,49 +436,88 @@ class MetalRenderer: NSObject, MTKViewDelegate {
                 if seenNames.insert(param.name).inserted { allParams.append(param) }
             }
         }
-        meshParams = allParams
-        
-        let header = ShaderSnippets.generateSharedHeader(config: dataFlowConfig)
+
+        let header = ShaderSnippets.generateSharedHeader(config: dfConfig)
         let paramHeader = ShaderSnippets.generateParamHeader(params: allParams)
-        
         let vBody = ShaderSnippets.injectParamsBuffer(into: vRawBody, paramCount: allParams.count)
         let fBody = ShaderSnippets.injectParamsBuffer(into: fRawBody, paramCount: allParams.count)
-        
         let vSource = header + paramHeader + vBody
         let fSource = header + paramHeader + fBody
+        let capturedParams = allParams
 
-        do {
-            let vLib = try device.makeLibrary(source: vSource, options: nil)
-            let fLib = try device.makeLibrary(source: fSource, options: nil)
+        compileQueue.async { [weak self] in
+            do {
+                let (vFunc, fFunc) = try Self.compileMeshLibrariesWithRetry(
+                    device: dev, vSource: vSource, fSource: fSource)
 
-            guard let vertexFunc = vLib.makeFunction(name: "vertex_main"),
-                  let fragFunc = fLib.makeFunction(name: "fragment_main") else {
-                print("Missing vertex_main or fragment_main in mesh shaders")
-                return
+                let pipelineDescriptor = MTLRenderPipelineDescriptor()
+                pipelineDescriptor.vertexFunction = vFunc
+                pipelineDescriptor.fragmentFunction = fFunc
+                pipelineDescriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+                Self.configureAlphaBlending(on: pipelineDescriptor.colorAttachments[0])
+                pipelineDescriptor.depthAttachmentPixelFormat = .depth32Float
+
+                if let mesh = currentMesh {
+                    pipelineDescriptor.vertexDescriptor = MTKMetalVertexDescriptorFromModelIO(mesh.vertexDescriptor)
+                }
+
+                let state = try dev.makeRenderPipelineState(descriptor: pipelineDescriptor)
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.meshParams = capturedParams
+                    self.meshPipelineState = state
+                    NotificationCenter.default.post(name: .shaderCompilationResult, object: nil)
+                }
+            } catch {
+                let msg = Self.extractMSLErrors(from: "\(error)")
+                Thread.sleep(forTimeInterval: 0.3)
+                DispatchQueue.main.async {
+                    NotificationCenter.default.post(name: .shaderCompilationResult, object: msg)
+                }
             }
-
-            let pipelineDescriptor = MTLRenderPipelineDescriptor()
-            pipelineDescriptor.vertexFunction = vertexFunc
-            pipelineDescriptor.fragmentFunction = fragFunc
-            pipelineDescriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
-            Self.configureAlphaBlending(on: pipelineDescriptor.colorAttachments[0])
-            pipelineDescriptor.depthAttachmentPixelFormat = .depth32Float
-
-            if let mesh = self.mesh {
-                pipelineDescriptor.vertexDescriptor = MTKMetalVertexDescriptorFromModelIO(mesh.vertexDescriptor)
-            }
-
-            self.meshPipelineState = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
-            NotificationCenter.default.post(name: .shaderCompilationResult, object: nil)
-        } catch {
-            let msg = Self.extractMSLErrors(from: "\(error)")
-            NotificationCenter.default.post(name: .shaderCompilationResult, object: msg)
         }
     }
     
     /// Extracts concise MSL error lines from a Metal compilation error string.
+    /// Falls back to the localizedDescription when the error is a driver-level
+    /// failure (e.g. "Compiler failed to build request") rather than a shader
+    /// syntax error with `program_source:` line info.
+    /// Compiles vertex + fragment libraries for 3D mesh, with automatic retry
+    /// for transient Metal compiler daemon failures.
+    private static func compileMeshLibrariesWithRetry(
+        device dev: MTLDevice, vSource: String, fSource: String,
+        maxRetries: Int = 2
+    ) throws -> (MTLFunction, MTLFunction) {
+        var lastError: Error?
+        for attempt in 0...maxRetries {
+            do {
+                let vLib = try dev.makeLibrary(source: vSource, options: nil)
+                let fLib = try dev.makeLibrary(source: fSource, options: nil)
+                guard let vFunc = vLib.makeFunction(name: "vertex_main"),
+                      let fFunc = fLib.makeFunction(name: "fragment_main") else {
+                    throw NSError(domain: "ShaderCanvas", code: -1,
+                                  userInfo: [NSLocalizedDescriptionKey: "Missing vertex_main or fragment_main"])
+                }
+                return (vFunc, fFunc)
+            } catch {
+                lastError = error
+                let msg = "\(error)"
+                let isTransient = msg.contains("Compiler failed") || msg.contains("failed to build request")
+                if isTransient && attempt < maxRetries {
+                    let delay = Double(attempt + 1) * 1.0
+                    print("[MetalRenderer] Transient mesh compiler failure (attempt \(attempt+1)/\(maxRetries+1)), retrying in \(delay)s…")
+                    Thread.sleep(forTimeInterval: delay)
+                    continue
+                }
+                throw error
+            }
+        }
+        throw lastError ?? NSError(domain: "ShaderCanvas", code: -1,
+                                   userInfo: [NSLocalizedDescriptionKey: "Mesh compilation failed after retries"])
+    }
+
     private static func extractMSLErrors(from fullError: String) -> String {
-        fullError.components(separatedBy: "\n")
+        let mslLines = fullError.components(separatedBy: "\n")
             .filter { $0.contains("error:") }
             .map { line in
                 if let range = line.range(of: #"program_source:\d+:\d+: error: .+"#, options: .regularExpression) {
@@ -470,6 +526,14 @@ class MetalRenderer: NSObject, MTKViewDelegate {
                 return line
             }
             .joined(separator: "\n")
+
+        if !mslLines.isEmpty { return mslLines }
+
+        if let range = fullError.range(of: #"\"[^\"]+\""#, options: .regularExpression) {
+            return String(fullError[range]).trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+        }
+        let trimmed = fullError.trimmingCharacters(in: .whitespacesAndNewlines)
+        return String(trimmed.prefix(300))
     }
 
     /// Compiles one pipeline per fullscreen (post-processing) shader layer.
@@ -483,15 +547,18 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     ///
     /// - Parameter metalView: The MTKView, needed for pixel format information.
     func compileFullscreenPipelines(metalView: MTKView) {
-        var newStates: [UUID: MTLRenderPipelineState] = [:]
-        var newParams: [UUID: [ShaderParam]] = [:]
+        guard let dev = device else { return }
         let fullscreenShaders = activeShaders.filter { $0.category == .fullscreen }
 
-        var hasError = false
+        struct PreparedShader {
+            let id: UUID
+            let source: String
+            let params: [ShaderParam]
+        }
+
+        var prepared: [PreparedShader] = []
         for shader in fullscreenShaders {
             let params = ShaderSnippets.parseParams(from: shader.code)
-            newParams[shader.id] = params
-            
             var source = shader.code
             if !params.isEmpty {
                 let paramHeader = ShaderSnippets.generateParamHeader(params: params)
@@ -501,32 +568,47 @@ class MetalRenderer: NSObject, MTKViewDelegate {
                 source.insert(contentsOf: paramHeader, at: insertionPoint)
                 source = ShaderSnippets.injectParamsBuffer(into: source, paramCount: params.count)
             }
-            
-            do {
-                let lib = try device.makeLibrary(source: source, options: nil)
-                guard let vertexFunc = lib.makeFunction(name: "vertex_main"),
-                      let fragFunc = lib.makeFunction(name: "fragment_main") else {
-                    print("Missing vertex_main or fragment_main in \(shader.name)")
-                    continue
-                }
-                let descriptor = MTLRenderPipelineDescriptor()
-                descriptor.vertexFunction = vertexFunc
-                descriptor.fragmentFunction = fragFunc
-                descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+            prepared.append(PreparedShader(id: shader.id, source: source, params: params))
+        }
 
-                let state = try device.makeRenderPipelineState(descriptor: descriptor)
-                newStates[shader.id] = state
-            } catch {
-                hasError = true
-                let msg = Self.extractMSLErrors(from: "\(error)")
-                NotificationCenter.default.post(name: .shaderCompilationResult, object: "[\(shader.name)] \(msg)")
+        compileQueue.async { [weak self] in
+            var newStates: [UUID: MTLRenderPipelineState] = [:]
+            var newParams: [UUID: [ShaderParam]] = [:]
+            var hasError = false
+            var firstError: String?
+
+            for item in prepared {
+                newParams[item.id] = item.params
+                do {
+                    let lib = try dev.makeLibrary(source: item.source, options: nil)
+                    guard let vertexFunc = lib.makeFunction(name: "vertex_main"),
+                          let fragFunc = lib.makeFunction(name: "fragment_main") else {
+                        continue
+                    }
+                    let descriptor = MTLRenderPipelineDescriptor()
+                    descriptor.vertexFunction = vertexFunc
+                    descriptor.fragmentFunction = fragFunc
+                    descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+                    newStates[item.id] = try dev.makeRenderPipelineState(descriptor: descriptor)
+                } catch {
+                    hasError = true
+                    let msg = Self.extractMSLErrors(from: "\(error)")
+                    if firstError == nil { firstError = msg }
+                    Thread.sleep(forTimeInterval: 0.3)
+                }
+            }
+
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.fullscreenPipelineStates = newStates
+                self.fullscreenParams = newParams
+                if hasError, let errMsg = firstError {
+                    NotificationCenter.default.post(name: .shaderCompilationResult, object: errMsg)
+                } else {
+                    NotificationCenter.default.post(name: .shaderCompilationResult, object: nil)
+                }
             }
         }
-        if !hasError {
-            NotificationCenter.default.post(name: .shaderCompilationResult, object: nil)
-        }
-        fullscreenPipelineStates = newStates
-        fullscreenParams = newParams
     }
 
     /// Compiles the final blit pipeline that copies the composited result to the screen.
@@ -598,70 +680,120 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         }
     }
 
-    /// Compiles one pipeline per Object2D.
+    /// Compiles one pipeline per Object2D on a serial background queue.
     /// Each pipeline merges: user distort_main → system vertex_main wrapper →
     /// user fragment_main (renamed) → SDF mask wrapper.  Single-pass alpha-blend.
+    ///
+    /// Uses `compileQueue` (serial) to ensure only one `makeLibrary(source:)`
+    /// runs at a time, preventing Metal driver file-lock contention (`flock`
+    /// errno 35) that can stall the main thread. A generation counter lets us
+    /// discard results from superseded compilations.
     func compileObject2DPipelines() {
-        var newStates: [UUID: MTLRenderPipelineState] = [:]
-        var hasError = false
+        guard let dev = device else { return }
+        compileGeneration &+= 1
+        let expectedGen = compileGeneration
+        let objs = objects2D
+        let sharedVS = sharedVertexCode2D
+        let sharedFS = sharedFragmentCode2D
+        let dfConfig = dataFlow2DConfig
 
-        for object in objects2D {
-            let vsUserCode = object.customVertexCode ?? sharedVertexCode2D
-            let fsUserCode = object.customFragmentCode ?? sharedFragmentCode2D
-            let shape = object.shapeType
+        compileQueue.async { [weak self] in
+            var newStates: [UUID: MTLRenderPipelineState] = [:]
+            var hasError = false
+            var firstError: String?
 
-            let header = ShaderSnippets.generateSharedHeader2D(config: dataFlow2DConfig)
+            for object in objs {
+                if let s = self, expectedGen != s.compileGeneration { return }
 
-            // Merge params from both VS and FS to support @param in distortion shaders
-            var allParams: [ShaderParam] = []
-            var seenNames = Set<String>()
-            for code in [vsUserCode, fsUserCode] {
-                for param in ShaderSnippets.parseParams(from: code) {
-                    if seenNames.insert(param.name).inserted { allParams.append(param) }
+                let vsUserCode = object.customVertexCode ?? sharedVS
+                let fsUserCode = object.customFragmentCode ?? sharedFS
+                let shape = object.shapeType
+
+                let header = ShaderSnippets.generateSharedHeader2D(config: dfConfig)
+
+                var allParams: [ShaderParam] = []
+                var seenNames = Set<String>()
+                for code in [vsUserCode, fsUserCode] {
+                    for param in ShaderSnippets.parseParams(from: code) {
+                        if seenNames.insert(param.name).inserted { allParams.append(param) }
+                    }
+                }
+                let paramHeader = ShaderSnippets.generateParamHeader(params: allParams)
+                let totalParamCount = allParams.count
+
+                let vsStripped = ShaderSnippets.stripStructDefinitions(from: vsUserCode)
+                let vsInjected = ShaderSnippets.inject2DVertexParamsBuffer(into: vsStripped, paramCount: totalParamCount)
+                let vsWrapper = ShaderSnippets.generate2DVertexWrapper(shape: shape, config: dfConfig, hasParams: totalParamCount > 0)
+                let vsSource = header + paramHeader + vsInjected + vsWrapper
+
+                let fsStripped = ShaderSnippets.stripStructDefinitions(from: fsUserCode)
+                let sdfAccess = object.shapeLocked && object.customFragmentCode != nil
+                let fsWrapped = ShaderSnippets.wrapFragmentWithSDF(userCode: fsStripped, shape: shape, hasParams: totalParamCount > 0, sdfAccessEnabled: sdfAccess)
+                let fsSource = header + paramHeader + fsWrapped
+
+                do {
+                    let pipeline = try Self.compileObject2DPipelineWithRetry(
+                        device: dev, vsSource: vsSource, fsSource: fsSource)
+                    newStates[object.id] = pipeline
+                } catch {
+                    hasError = true
+                    let msg = Self.extractMSLErrors(from: "\(error)")
+                    if firstError == nil { firstError = "[\(object.name)] \(msg)" }
+                    Thread.sleep(forTimeInterval: 0.3)
                 }
             }
-            let paramHeader = ShaderSnippets.generateParamHeader(params: allParams)
-            let totalParamCount = allParams.count
 
-            // VS: header + params + user distort_main + system vertex_main wrapper
-            let vsStripped = ShaderSnippets.stripStructDefinitions(from: vsUserCode)
-            let vsInjected = ShaderSnippets.inject2DVertexParamsBuffer(into: vsStripped, paramCount: totalParamCount)
-            let vsWrapper = ShaderSnippets.generate2DVertexWrapper(shape: shape, config: dataFlow2DConfig, hasParams: totalParamCount > 0)
-            let vsSource = header + paramHeader + vsInjected + vsWrapper
+            DispatchQueue.main.async {
+                guard let self, expectedGen == self.compileGeneration else { return }
+                self.object2DPipelineStates = newStates
+                if hasError, let errMsg = firstError {
+                    NotificationCenter.default.post(name: .shaderCompilationResult, object: errMsg)
+                } else {
+                    NotificationCenter.default.post(name: .shaderCompilationResult, object: nil)
+                }
+            }
+        }
+    }
 
-            // FS: header + params + SDF-wrapped user fragment
-            // NOTE: Do NOT call injectParamsBuffer here — wrapFragmentWithSDF
-            // handles params injection itself to guarantee correct argument order
-            // when both bgTexture and params are present.
-            let fsStripped = ShaderSnippets.stripStructDefinitions(from: fsUserCode)
-            let fsWrapped = ShaderSnippets.wrapFragmentWithSDF(userCode: fsStripped, shape: shape, hasParams: totalParamCount > 0)
-            let fsSource = header + paramHeader + fsWrapped
-
+    /// Compiles a single Object2D pipeline (vertex + fragment), with automatic
+    /// retry for transient Metal compiler daemon failures ("Compiler failed to
+    /// build request"). These aren't shader bugs — the daemon crashed — so we
+    /// wait and retry the exact same code rather than asking the AI to "fix" it.
+    private static func compileObject2DPipelineWithRetry(
+        device dev: MTLDevice, vsSource: String, fsSource: String,
+        maxRetries: Int = 2
+    ) throws -> MTLRenderPipelineState {
+        var lastError: Error?
+        for attempt in 0...maxRetries {
             do {
-                let vLib = try device.makeLibrary(source: vsSource, options: nil)
-                let fLib = try device.makeLibrary(source: fsSource, options: nil)
+                let vLib = try dev.makeLibrary(source: vsSource, options: nil)
+                let fLib = try dev.makeLibrary(source: fsSource, options: nil)
                 guard let vFunc = vLib.makeFunction(name: "vertex_main"),
                       let fFunc = fLib.makeFunction(name: "fragment_main") else {
-                    print("Missing entry point for 2D object \(object.name)")
-                    continue
+                    throw NSError(domain: "ShaderCanvas", code: -1,
+                                  userInfo: [NSLocalizedDescriptionKey: "Missing vertex_main or fragment_main entry point"])
                 }
                 let desc = MTLRenderPipelineDescriptor()
                 desc.vertexFunction = vFunc
                 desc.fragmentFunction = fFunc
                 desc.colorAttachments[0].pixelFormat = .bgra8Unorm
-                Self.configureAlphaBlending(on: desc.colorAttachments[0])
-                newStates[object.id] = try device.makeRenderPipelineState(descriptor: desc)
+                configureAlphaBlending(on: desc.colorAttachments[0])
+                return try dev.makeRenderPipelineState(descriptor: desc)
             } catch {
-                hasError = true
-                let msg = Self.extractMSLErrors(from: "\(error)")
-                NotificationCenter.default.post(name: .shaderCompilationResult, object: "[\(object.name)] \(msg)")
+                lastError = error
+                let msg = "\(error)"
+                let isTransient = msg.contains("Compiler failed") || msg.contains("failed to build request")
+                if isTransient && attempt < maxRetries {
+                    let delay = Double(attempt + 1) * 1.0
+                    print("[MetalRenderer] Transient compiler failure (attempt \(attempt+1)/\(maxRetries+1)), retrying in \(delay)s…")
+                    Thread.sleep(forTimeInterval: delay)
+                    continue
+                }
+                throw error
             }
         }
-
-        if !hasError {
-            NotificationCenter.default.post(name: .shaderCompilationResult, object: nil)
-        }
-        object2DPipelineStates = newStates
+        throw lastError ?? NSError(domain: "ShaderCanvas", code: -1,
+                                   userInfo: [NSLocalizedDescriptionKey: "Compilation failed after retries"])
     }
 
     // MARK: - Background Image Loading
@@ -757,9 +889,19 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     ///
     /// - Parameter view: The MTKView requesting a new frame.
     func draw(in view: MTKView) {
+        // Non-blocking frame gate: if the GPU already has 3 frames in flight
+        // (e.g. the Metal driver stalled after a compiler failure), skip this
+        // frame instead of letting `currentDrawable` block the main thread.
+        guard frameSemaphore.wait(timeout: .now()) == .success else { return }
+
         guard let drawable = view.currentDrawable,
               let commandBuffer = commandQueue.makeCommandBuffer() else {
+            frameSemaphore.signal()
             return
+        }
+
+        commandBuffer.addCompletedHandler { [weak self] _ in
+            self?.frameSemaphore.signal()
         }
 
         // Read normalised mouse position from the tracking view.
@@ -773,7 +915,10 @@ class MetalRenderer: NSObject, MTKViewDelegate {
             setupOffscreenTextures(size: size)
         }
 
-        guard let texA = offscreenTextureA, let texB = offscreenTextureB, let depthTex = depthTexture else { return }
+        guard let texA = offscreenTextureA, let texB = offscreenTextureB, let depthTex = depthTexture else {
+            frameSemaphore.signal()
+            return
+        }
 
         // Advance the animation clock (~60fps assumed).
         time += 1.0 / 60.0
@@ -1071,27 +1216,158 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     ///
     /// Downscales to at most 512x512 to keep token cost reasonable (~85 tokens for
     /// a low-detail JPEG). Returns base64-encoded JPEG data, or nil on failure.
+    ///
+    /// Thread-safe: uses CGContext instead of NSImage.lockFocus (which requires
+    /// the main thread and deadlocks when called from Task.detached).
     func captureForAI(maxDimension: Int = 512) -> Data? {
         guard let nsImage = captureSnapshot() else { return nil }
-        let origW = nsImage.size.width
-        let origH = nsImage.size.height
+        return Self.resizeAndCompress(nsImage, maxDimension: maxDimension)
+    }
+
+    /// Renders a single 2D object in isolation and returns a JPEG snapshot.
+    /// Used for multimodal verification so the AI sees only its own output.
+    func capturePreviewObject(_ objectID: UUID, maxDimension: Int = 512) -> Data? {
+        guard let object = objects2D.first(where: { $0.id == objectID }),
+              let pipeline = object2DPipelineStates[objectID],
+              let texA = offscreenTextureA,
+              let texB = offscreenTextureB,
+              let cmdBuf = commandQueue.makeCommandBuffer() else { return nil }
+
+        let size = CGSize(width: texA.width, height: texA.height)
+
+        let clearDesc = MTLRenderPassDescriptor()
+        clearDesc.colorAttachments[0].texture = texA
+        clearDesc.colorAttachments[0].loadAction = .clear
+        clearDesc.colorAttachments[0].clearColor = MTLClearColor(red: 0.118, green: 0.118, blue: 0.137, alpha: 1.0)
+        clearDesc.colorAttachments[0].storeAction = .store
+
+        if let enc = cmdBuf.makeRenderCommandEncoder(descriptor: clearDesc) {
+            if let gridPipeline = gridPipelineState {
+                enc.setRenderPipelineState(gridPipeline)
+                var u = Uniforms2D(resolution: simd_float2(Float(size.width), Float(size.height)),
+                                   time: time, mouseX: 0, mouseY: 0)
+                enc.setFragmentBytes(&u, length: MemoryLayout<Uniforms2D>.stride, index: 1)
+                var gt = Transform2D(canvasPan: .zero, canvasZoom: 1.0)
+                enc.setVertexBytes(&gt, length: MemoryLayout<Transform2D>.stride, index: 3)
+                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+            }
+            enc.endEncoding()
+        }
+
+        if let blitEnc = cmdBuf.makeBlitCommandEncoder() {
+            blitEnc.copy(from: texA, to: texB)
+            blitEnc.endEncoding()
+        }
+
+        let passDesc = MTLRenderPassDescriptor()
+        passDesc.colorAttachments[0].texture = texA
+        passDesc.colorAttachments[0].loadAction = .load
+        passDesc.colorAttachments[0].storeAction = .store
+
+        if let enc = cmdBuf.makeRenderCommandEncoder(descriptor: passDesc) {
+            enc.setRenderPipelineState(pipeline)
+            var u = Uniforms2D(resolution: simd_float2(Float(size.width), Float(size.height)),
+                               time: time, mouseX: 0, mouseY: 0)
+            enc.setVertexBytes(&u, length: MemoryLayout<Uniforms2D>.stride, index: 1)
+            enc.setFragmentBytes(&u, length: MemoryLayout<Uniforms2D>.stride, index: 1)
+            enc.setFragmentTexture(texB, index: 0)
+
+            var transform = Transform2D(
+                objectOffset: simd_float2(0, 0),
+                objectScale: simd_float2(object.scaleW, object.scaleH),
+                canvasPan: .zero, canvasZoom: 1.0,
+                objectRotation: object.rotation,
+                cornerRadius: object.cornerRadius
+            )
+            enc.setVertexBytes(&transform, length: MemoryLayout<Transform2D>.stride, index: 3)
+
+            let vsCode = object.customVertexCode ?? sharedVertexCode2D
+            let fsCode = object.customFragmentCode ?? sharedFragmentCode2D
+            var drawParams: [ShaderParam] = []
+            var seen = Set<String>()
+            for code in [vsCode, fsCode] {
+                for p in ShaderSnippets.parseParams(from: code) {
+                    if seen.insert(p.name).inserted { drawParams.append(p) }
+                }
+            }
+            if !drawParams.isEmpty {
+                var buf = ShaderSnippets.packParamBuffer(params: drawParams, values: paramValues)
+                let len = buf.count * MemoryLayout<Float>.stride
+                enc.setVertexBytes(&buf, length: len, index: 2)
+                enc.setFragmentBytes(&buf, length: len, index: 2)
+            }
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+            enc.endEncoding()
+        }
+
+        cmdBuf.commit()
+        cmdBuf.waitUntilCompleted()
+
+        guard let snapshot = textureToImage(texA) else { return nil }
+        return compressSnapshot(snapshot, maxDimension: maxDimension)
+    }
+
+    private func textureToImage(_ texture: MTLTexture) -> NSImage? {
+        let w = texture.width, h = texture.height
+        guard w > 0, h > 0 else { return nil }
+        let bytesPerRow = w * 4
+        let region = MTLRegion(origin: .init(x: 0, y: 0, z: 0),
+                               size: .init(width: w, height: h, depth: 1))
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm, width: w, height: h, mipmapped: false)
+        desc.storageMode = .managed
+        desc.usage = .shaderRead
+        guard let readable = device.makeTexture(descriptor: desc),
+              let buf = commandQueue.makeCommandBuffer(),
+              let blit = buf.makeBlitCommandEncoder() else { return nil }
+        blit.copy(from: texture, to: readable)
+        blit.synchronize(resource: readable)
+        blit.endEncoding()
+        buf.commit()
+        buf.waitUntilCompleted()
+
+        var bytes = [UInt8](repeating: 0, count: bytesPerRow * h)
+        readable.getBytes(&bytes, bytesPerRow: bytesPerRow, from: region, mipmapLevel: 0)
+        guard let provider = CGDataProvider(data: Data(bytes) as CFData),
+              let cgImage = CGImage(width: w, height: h, bitsPerComponent: 8,
+                                    bitsPerPixel: 32, bytesPerRow: bytesPerRow,
+                                    space: CGColorSpaceCreateDeviceRGB(),
+                                    bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue),
+                                    provider: provider, decode: nil, shouldInterpolate: false,
+                                    intent: .defaultIntent)
+        else { return nil }
+        return NSImage(cgImage: cgImage, size: NSSize(width: w, height: h))
+    }
+
+    private func compressSnapshot(_ image: NSImage, maxDimension: Int) -> Data? {
+        Self.resizeAndCompress(image, maxDimension: maxDimension)
+    }
+
+    /// Thread-safe image resize + JPEG compression using CGContext.
+    /// Unlike NSImage.lockFocus (which requires the main thread), CGContext
+    /// operations are safe on any thread.
+    static func resizeAndCompress(_ image: NSImage, maxDimension: Int = 512, quality: CGFloat = 0.6) -> Data? {
+        guard let cgSrc = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+        let origW = cgSrc.width, origH = cgSrc.height
         guard origW > 0, origH > 0 else { return nil }
 
-        let scale = min(1.0, min(CGFloat(maxDimension) / origW, CGFloat(maxDimension) / origH))
-        let newW = Int(origW * scale)
-        let newH = Int(origH * scale)
+        let scale = min(1.0, min(CGFloat(maxDimension) / CGFloat(origW),
+                                  CGFloat(maxDimension) / CGFloat(origH)))
+        let newW = Int(CGFloat(origW) * scale)
+        let newH = Int(CGFloat(origH) * scale)
 
-        let resized = NSImage(size: NSSize(width: newW, height: newH))
-        resized.lockFocus()
-        NSGraphicsContext.current?.imageInterpolation = .high
-        nsImage.draw(in: NSRect(x: 0, y: 0, width: newW, height: newH))
-        resized.unlockFocus()
+        guard let ctx = CGContext(
+            data: nil, width: newW, height: newH,
+            bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+        ) else { return nil }
+        ctx.interpolationQuality = .high
+        ctx.draw(cgSrc, in: CGRect(x: 0, y: 0, width: newW, height: newH))
 
-        guard let tiff = resized.tiffRepresentation,
-              let bitmap = NSBitmapImageRep(data: tiff),
-              let jpeg = bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.6])
-        else { return nil }
-        return jpeg
+        guard let resized = ctx.makeImage() else { return nil }
+        let rep = NSBitmapImageRep(cgImage: resized)
+        return rep.representation(using: .jpeg, properties: [.compressionFactor: quality])
     }
 
     /// Captures the current offscreen texture A as an NSImage (for Hub thumbnails).

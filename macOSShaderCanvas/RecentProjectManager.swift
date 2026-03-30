@@ -84,27 +84,30 @@ class RecentProjectManager {
     private func saveSnapshot(_ image: NSImage, for fileURL: URL) -> String? {
         guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
 
-        let thumbSize = NSSize(width: 400, height: 300)
-        let thumb = NSImage(size: thumbSize)
-        thumb.lockFocus()
-        NSGraphicsContext.current?.imageInterpolation = .high
-        let srcAspect = CGFloat(cgImage.width) / CGFloat(cgImage.height)
-        let dstAspect = thumbSize.width / thumbSize.height
-        var drawRect = NSRect(origin: .zero, size: thumbSize)
-        if srcAspect > dstAspect {
-            let h = thumbSize.width / srcAspect
-            drawRect = NSRect(x: 0, y: (thumbSize.height - h) / 2, width: thumbSize.width, height: h)
-        } else {
-            let w = thumbSize.height * srcAspect
-            drawRect = NSRect(x: (thumbSize.width - w) / 2, y: 0, width: w, height: thumbSize.height)
-        }
-        NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
-            .draw(in: drawRect)
-        thumb.unlockFocus()
+        let thumbW = 400, thumbH = 300
+        guard let ctx = CGContext(
+            data: nil, width: thumbW, height: thumbH,
+            bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+        ) else { return nil }
+        ctx.interpolationQuality = .high
 
-        guard let tiff = thumb.tiffRepresentation,
-              let bitmap = NSBitmapImageRep(data: tiff),
-              let png = bitmap.representation(using: .png, properties: [:]) else { return nil }
+        let srcAspect = CGFloat(cgImage.width) / CGFloat(cgImage.height)
+        let dstAspect = CGFloat(thumbW) / CGFloat(thumbH)
+        var drawRect = CGRect(x: 0, y: 0, width: thumbW, height: thumbH)
+        if srcAspect > dstAspect {
+            let h = CGFloat(thumbW) / srcAspect
+            drawRect = CGRect(x: 0, y: (CGFloat(thumbH) - h) / 2, width: CGFloat(thumbW), height: h)
+        } else {
+            let w = CGFloat(thumbH) * srcAspect
+            drawRect = CGRect(x: (CGFloat(thumbW) - w) / 2, y: 0, width: w, height: CGFloat(thumbH))
+        }
+        ctx.draw(cgImage, in: drawRect)
+
+        guard let thumbCG = ctx.makeImage() else { return nil }
+        let rep = NSBitmapImageRep(cgImage: thumbCG)
+        guard let png = rep.representation(using: .png, properties: [:]) else { return nil }
 
         let id = fileURL.deletingPathExtension().lastPathComponent
             .replacingOccurrences(of: " ", with: "_")

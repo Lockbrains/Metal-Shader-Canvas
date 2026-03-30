@@ -108,6 +108,28 @@ struct LabView: View {
     // MARK: - Body
 
     var body: some View {
+        labMainLayout
+            .modifier(LabEventModifier(
+                onInit: { initializeFromAppState() },
+                onBackToHub: { requestNavigateBackToHub() },
+                onSave: { performSave() },
+                onSaveAs: { performSaveAs() },
+                onShowSettings: { showingAISettings = true }
+            ))
+            .modifier(LabChangeTrackingModifier(
+                activeShaders: activeShaders,
+                objects2D: objects2D,
+                paramValues: paramValues,
+                canvasName: canvasName,
+                dataFlowConfig: dataFlowConfig,
+                dataFlow2DConfig: dataFlow2DConfig,
+                sharedVertexCode2D: sharedVertexCode2D,
+                sharedFragmentCode2D: sharedFragmentCode2D,
+                onChanged: { hasUnsavedChanges = true }
+            ))
+    }
+
+    private var labMainLayout: some View {
         ZStack {
             Color(nsColor: NSColor(red: 0.10, green: 0.10, blue: 0.11, alpha: 1.0))
                 .ignoresSafeArea()
@@ -136,21 +158,6 @@ struct LabView: View {
                 }
             }
         }
-        .onAppear { initializeFromAppState() }
-        .onReceive(NotificationCenter.default.publisher(for: .backToHub)) { _ in
-            requestNavigateBackToHub()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .canvasSave)) { _ in performSave() }
-        .onReceive(NotificationCenter.default.publisher(for: .canvasSaveAs)) { _ in performSaveAs() }
-        .onReceive(NotificationCenter.default.publisher(for: .aiSettings)) { _ in showingAISettings = true }
-        .onChange(of: activeShaders) { hasUnsavedChanges = true }
-        .onChange(of: objects2D) { hasUnsavedChanges = true }
-        .onChange(of: paramValues) { hasUnsavedChanges = true }
-        .onChange(of: canvasName) { hasUnsavedChanges = true }
-        .onChange(of: dataFlowConfig) { hasUnsavedChanges = true }
-        .onChange(of: dataFlow2DConfig) { hasUnsavedChanges = true }
-        .onChange(of: sharedVertexCode2D) { hasUnsavedChanges = true }
-        .onChange(of: sharedFragmentCode2D) { hasUnsavedChanges = true }
         .alert(String(localized: "Back to Hub"), isPresented: $showingBackToHubConfirm) {
             Button(String(localized: "Save & Return"), role: nil) {
                 performSave()
@@ -532,13 +539,20 @@ struct LabView: View {
     }
 
     private func executeAgentActions(_ actions: [AgentAction]) {
+        var noLocks = Set<String>()
         let result = CanvasActions.executeAgentActions(
             actions,
             activeShaders: &activeShaders,
             objects2D: &objects2D,
             sharedVertexCode2D: &sharedVertexCode2D,
-            sharedFragmentCode2D: &sharedFragmentCode2D
+            sharedFragmentCode2D: &sharedFragmentCode2D,
+            approvedShapeLocks: &noLocks
         )
+        for req in result.shapeLockRequests {
+            if let idx = objects2D.firstIndex(where: { $0.name == req.objectName }) {
+                objects2D[idx].shapeLocked = true
+            }
+        }
         if let id = result.firstShaderID {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
                 withAnimation {
@@ -646,5 +660,52 @@ struct LabView: View {
         } catch {
             print("Lab open error: \(error)")
         }
+    }
+}
+
+// MARK: - LabView Helper Modifiers
+
+/// Extracts lifecycle and notification receivers into a separate modifier
+/// to reduce type-checker load on LabView.body.
+private struct LabEventModifier: ViewModifier {
+    let onInit: () -> Void
+    let onBackToHub: () -> Void
+    let onSave: () -> Void
+    let onSaveAs: () -> Void
+    let onShowSettings: () -> Void
+
+    func body(content: Content) -> some View {
+        content
+            .onAppear { onInit() }
+            .onReceive(NotificationCenter.default.publisher(for: .backToHub)) { _ in onBackToHub() }
+            .onReceive(NotificationCenter.default.publisher(for: .canvasSave)) { _ in onSave() }
+            .onReceive(NotificationCenter.default.publisher(for: .canvasSaveAs)) { _ in onSaveAs() }
+            .onReceive(NotificationCenter.default.publisher(for: .aiSettings)) { _ in onShowSettings() }
+    }
+}
+
+/// Tracks all state changes that mark the document as unsaved.
+/// Consolidated into a single modifier to help the Swift type-checker.
+private struct LabChangeTrackingModifier: ViewModifier {
+    let activeShaders: [ActiveShader]
+    let objects2D: [Object2D]
+    let paramValues: [String: [Float]]
+    let canvasName: String
+    let dataFlowConfig: DataFlowConfig
+    let dataFlow2DConfig: DataFlow2DConfig
+    let sharedVertexCode2D: String
+    let sharedFragmentCode2D: String
+    let onChanged: () -> Void
+
+    func body(content: Content) -> some View {
+        content
+            .onChange(of: activeShaders) { onChanged() }
+            .onChange(of: objects2D) { onChanged() }
+            .onChange(of: paramValues) { onChanged() }
+            .onChange(of: canvasName) { onChanged() }
+            .onChange(of: dataFlowConfig) { onChanged() }
+            .onChange(of: dataFlow2DConfig) { onChanged() }
+            .onChange(of: sharedVertexCode2D) { onChanged() }
+            .onChange(of: sharedFragmentCode2D) { onChanged() }
     }
 }
