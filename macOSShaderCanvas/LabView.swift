@@ -20,6 +20,17 @@ import SwiftUI
 import UniformTypeIdentifiers
 import simd
 
+// MARK: - Chat State Container
+
+/// Isolates chat message mutations from LabView's body evaluation.
+/// Without this, every `messages.append` would re-evaluate the entire
+/// LabView body — including MetalView (NSViewRepresentable), which
+/// triggers `updateNSView` and blocks the main thread.
+@Observable
+class LabChatStore {
+    var messages: [ChatMessage] = []
+}
+
 // MARK: - LabView
 
 struct LabView: View {
@@ -72,7 +83,7 @@ struct LabView: View {
 
     @State private var aiSettings = AISettings()
     @State private var showingAISettings = false
-    @State private var chatMessages: [ChatMessage] = []
+    @State private var chatStore = LabChatStore()
     @State private var compilationError: String? = nil
 
     // MARK: - Lab-Specific State
@@ -108,13 +119,17 @@ struct LabView: View {
     // MARK: - Body
 
     var body: some View {
+        let _ = print("[DIAG] LabView.body EVALUATED  \(CFAbsoluteTimeGetCurrent())")
         labMainLayout
             .modifier(LabEventModifier(
                 onInit: { initializeFromAppState() },
                 onBackToHub: { requestNavigateBackToHub() },
                 onSave: { performSave() },
                 onSaveAs: { performSaveAs() },
-                onShowSettings: { showingAISettings = true }
+                onShowSettings: { showingAISettings = true },
+                onCompilationResult: { error in
+                    withAnimation(.easeInOut(duration: 0.2)) { compilationError = error }
+                }
             ))
             .modifier(LabChangeTrackingModifier(
                 activeShaders: activeShaders,
@@ -362,7 +377,7 @@ struct LabView: View {
             switch rightPanelTab {
             case .chat:
                 LabChatView(
-                    messages: $chatMessages,
+                    chatStore: chatStore,
                     labSession: $labSession,
                     references: references,
                     projectDocument: $projectDocument,
@@ -539,6 +554,8 @@ struct LabView: View {
     }
 
     private func executeAgentActions(_ actions: [AgentAction]) {
+        applyDataFlowActions(actions)
+
         var noLocks = Set<String>()
         let result = CanvasActions.executeAgentActions(
             actions,
@@ -563,6 +580,34 @@ struct LabView: View {
         } else if let id = result.firstObjectID {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
                 withAnimation { selectedObjectID = id }
+            }
+        }
+    }
+
+    private func applyDataFlowActions(_ actions: [AgentAction]) {
+        for action in actions where action.type == .enableDataFlow {
+            let fields = Set(
+                action.code
+                    .split(separator: ",")
+                    .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+            )
+            if canvasMode.is2D {
+                var cfg = dataFlow2DConfig
+                if fields.contains("time") { cfg.timeEnabled = true }
+                if fields.contains("mouse") { cfg.mouseEnabled = true }
+                if fields.contains("objectposition") { cfg.objectPositionEnabled = true }
+                if fields.contains("screenuv") { cfg.screenUVEnabled = true }
+                if cfg != dataFlow2DConfig { dataFlow2DConfig = cfg }
+            } else {
+                var cfg = dataFlowConfig
+                if fields.contains("normal") { cfg.normalEnabled = true }
+                if fields.contains("uv") { cfg.uvEnabled = true }
+                if fields.contains("time") { cfg.timeEnabled = true }
+                if fields.contains("worldposition") { cfg.worldPositionEnabled = true }
+                if fields.contains("worldnormal") { cfg.worldNormalEnabled = true }
+                if fields.contains("viewdirection") { cfg.viewDirectionEnabled = true }
+                cfg.resolveDependencies()
+                if cfg != dataFlowConfig { dataFlowConfig = cfg }
             }
         }
     }
@@ -621,10 +666,16 @@ struct LabView: View {
             try CanvasActions.saveDocument(doc, to: url)
             currentFileURL = url
             hasUnsavedChanges = false
-            if let capture = MetalRenderer.current?.captureForAI() {
-                recentManager.addRecent(name: canvasName, fileURL: url, mode: canvasMode, snapshot: NSImage(data: capture))
-            } else {
-                recentManager.addRecent(name: canvasName, fileURL: url, mode: canvasMode)
+            let savedName = canvasName
+            let savedMode = canvasMode
+            let savedURL = url
+            Task {
+                let capture = await Task.detached { MetalRenderer.current?.captureForAI() }.value
+                if let data = capture {
+                    recentManager.addRecent(name: savedName, fileURL: savedURL, mode: savedMode, snapshot: NSImage(data: data))
+                } else {
+                    recentManager.addRecent(name: savedName, fileURL: savedURL, mode: savedMode)
+                }
             }
         } catch {
             print("Lab save error: \(error)")
@@ -673,6 +724,7 @@ private struct LabEventModifier: ViewModifier {
     let onSave: () -> Void
     let onSaveAs: () -> Void
     let onShowSettings: () -> Void
+    let onCompilationResult: (String?) -> Void
 
     func body(content: Content) -> some View {
         content
@@ -681,6 +733,9 @@ private struct LabEventModifier: ViewModifier {
             .onReceive(NotificationCenter.default.publisher(for: .canvasSave)) { _ in onSave() }
             .onReceive(NotificationCenter.default.publisher(for: .canvasSaveAs)) { _ in onSaveAs() }
             .onReceive(NotificationCenter.default.publisher(for: .aiSettings)) { _ in onShowSettings() }
+            .onReceive(NotificationCenter.default.publisher(for: .shaderCompilationResult)) { n in
+                onCompilationResult(n.object as? String)
+            }
     }
 }
 

@@ -101,7 +101,14 @@ struct AIGlowBorder: View {
 /// The chat sends the user's active shader code as context to the AI,
 /// enabling shader-aware assistance.
 struct AIChatView: View {
-    @Binding var messages: [ChatMessage]
+    private static let streamingSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 300
+        config.timeoutIntervalForResource = 600
+        return URLSession(configuration: config)
+    }()
+
+    var chatStore: CanvasChatStore
     @Binding var isActive: Bool
     let activeShaders: [ActiveShader]
     let aiSettings: AISettings
@@ -160,7 +167,7 @@ struct AIChatView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 12) {
-                        ForEach(messages) { msg in
+                        ForEach(chatStore.messages) { msg in
                             MessageBubble(message: msg).id(msg.id)
                         }
                         // Streaming thinking display
@@ -179,13 +186,19 @@ struct AIChatView: View {
                         }
                     }.padding(16)
                 }
-                .onChange(of: messages.count) {
-                    withAnimation {
-                        if let lastID = messages.last?.id { proxy.scrollTo(lastID, anchor: .bottom) }
+                .onChange(of: chatStore.messages.count) {
+                    Task { @MainActor in
+                        try? await Task.sleep(for: .milliseconds(50))
+                        if let lastID = chatStore.messages.last?.id {
+                            proxy.scrollTo(lastID, anchor: .bottom)
+                        }
                     }
                 }
                 .onChange(of: streamingThinking) {
-                    withAnimation { proxy.scrollTo("streaming", anchor: .bottom) }
+                    Task { @MainActor in
+                        try? await Task.sleep(for: .milliseconds(80))
+                        proxy.scrollTo("streaming", anchor: .bottom)
+                    }
                 }
             }
 
@@ -286,146 +299,153 @@ struct AIChatView: View {
     /// Performs a streaming HTTP request directly from the UI Task, with zero
     /// actor crossings. Updates `streamingThinking` on every token so the user
     /// sees real-time output. Returns the full accumulated text.
+    private enum SSEChunk: Sendable {
+        case text(String)
+        case error(String)
+    }
+
     private func streamDirectSSE(
         systemPrompt: String,
         userContent: String,
         captured: CapturedAISettings,
         imageData: Data?
     ) async -> String {
-        var accumulated = ""
-
-        // Diagnostic: if this text never appears, @State updates from Task are broken
         streamingThinking = "⏳ Connecting to \(captured.provider.rawValue)..."
 
-        do {
-            let req = try buildStreamingURLRequest(
-                systemPrompt: systemPrompt,
-                userContent: userContent,
-                captured: captured,
-                imageData: imageData
-            )
+        let stream = Self.sseStream(
+            session: Self.streamingSession,
+            systemPrompt: systemPrompt,
+            userContent: userContent,
+            captured: captured,
+            imageData: imageData
+        )
 
-            // Use a custom session (URLSession.shared may have sandbox restrictions)
-            let config = URLSessionConfiguration.default
-            config.timeoutIntervalForRequest = 300
-            config.timeoutIntervalForResource = 600
-            let session = URLSession(configuration: config)
-
-            streamingThinking = "⏳ Waiting for \(captured.provider.rawValue) response..."
-
-            let (bytes, response) = try await session.bytes(for: req)
-
-            guard let http = response as? HTTPURLResponse else {
-                streamingThinking = "❌ No HTTP response received"
-                return ""
-            }
-
-            guard (200...299).contains(http.statusCode) else {
-                var errorBody = ""
-                for try await line in bytes.lines { errorBody += line }
-                let preview = String(errorBody.prefix(300))
-                streamingThinking = "❌ HTTP \(http.statusCode): \(preview)"
-                return ""
-            }
-
-            streamingThinking = "⏳ Streaming response..."
-
-            var tokenCount = 0
-            var rawLineCount = 0
-            var firstRawLines: [String] = []
-
-            if captured.provider == .gemini {
-                // Gemini sends literal newline bytes (0x0A) inside JSON "text" values
-                // instead of the JSON escape sequence \n. This breaks line-based SSE
-                // parsing because bytes.lines splits on every 0x0A, fragmenting JSON.
-                //
-                // Strategy: each SSE event starts with "data: ". When we see a NEW
-                // "data:" line, parse the PREVIOUS buffer. All other lines (including
-                // empty lines that are really literal newlines) are continuations.
-                // Before JSON parsing, we replace literal newlines with the JSON
-                // escape \n so JSONSerialization can handle it.
-                var geminiBuffer = ""
-
-                for try await line in bytes.lines {
-                    rawLineCount += 1
-                    if firstRawLines.count < 3 { firstRawLines.append(String(line.prefix(120))) }
-
-                    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if trimmed.hasPrefix("data:") {
-                        if !geminiBuffer.isEmpty {
-                            if let text = parseGeminiChunkSanitized(geminiBuffer) {
-                                accumulated += text
-                                tokenCount += 1
-                                streamingThinking = accumulated
-                            }
-                        }
-                        geminiBuffer = String(trimmed.dropFirst(5)).trimmingCharacters(in: .whitespaces)
-                    } else {
-                        if !geminiBuffer.isEmpty {
-                            geminiBuffer += "\n" + line
-                        }
-                    }
-                }
-
-                if !geminiBuffer.isEmpty {
-                    if let text = parseGeminiChunkSanitized(geminiBuffer) {
-                        accumulated += text
-                        tokenCount += 1
-                        streamingThinking = accumulated
-                    }
-                }
-            } else {
-                // Standard SSE parsing for OpenAI / Anthropic
-                var parser = SSELineParser()
-                for try await line in bytes.lines {
-                    rawLineCount += 1
-                    if firstRawLines.count < 3 { firstRawLines.append(String(line.prefix(120))) }
-                    if let event = parser.feedLine(line) {
-                        let text: String?
-                        switch captured.provider {
-                        case .openai:   text = parseOpenAIDelta(event.data)
-                        case .anthropic: text = parseAnthropicDelta(event.data, event: event.event)
-                        case .gemini:   text = nil
-                        }
-                        if let t = text {
-                            accumulated += t
-                            tokenCount += 1
-                            streamingThinking = accumulated
-                        }
-                    }
-                }
-                if let event = parser.feedLine("") {
-                    let text: String?
-                    switch captured.provider {
-                    case .openai:   text = parseOpenAIDelta(event.data)
-                    case .anthropic: text = parseAnthropicDelta(event.data, event: event.event)
-                    case .gemini:   text = nil
-                    }
-                    if let t = text {
-                        accumulated += t
-                        tokenCount += 1
-                        streamingThinking = accumulated
-                    }
+        var result = ""
+        for await chunk in stream {
+            switch chunk {
+            case .text(let text):
+                result = text
+                streamingThinking = text
+            case .error(let msg):
+                if result.isEmpty {
+                    streamingThinking = msg
+                    return ""
                 }
             }
-
-            if tokenCount == 0 && accumulated.isEmpty {
-                let preview = firstRawLines.joined(separator: "\n")
-                streamingThinking = "⚠️ 0 tokens / \(rawLineCount) lines.\n\(preview)"
-                return ""
-            }
-
-        } catch {
-            streamingThinking = "❌ Stream error: \(error.localizedDescription)"
-            if accumulated.isEmpty { return "" }
         }
 
         streamingThinking = ""
-        return accumulated
+        return result
+    }
+
+    /// Runs the SSE streaming loop entirely on a background thread.
+    /// URL request building (including base64 image encoding) and all JSON
+    /// parsing happen off the main thread. Yields partial accumulated text
+    /// via AsyncStream so the main thread only wakes up periodically for UI updates.
+    private static func sseStream(
+        session: URLSession,
+        systemPrompt: String, userContent: String,
+        captured: CapturedAISettings, imageData: Data?
+    ) -> AsyncStream<SSEChunk> {
+        let provider = captured.provider
+        return AsyncStream { continuation in
+            let task = Task.detached {
+                let request: URLRequest
+                do {
+                    request = try buildSSERequest(
+                        systemPrompt: systemPrompt, userContent: userContent,
+                        captured: captured, imageData: imageData
+                    )
+                } catch let reqError {
+                    continuation.yield(SSEChunk.error("❌ Build request error: \(reqError.localizedDescription)"))
+                    continuation.finish()
+                    return
+                }
+                do {
+                    let (bytes, response) = try await session.bytes(for: request)
+                    guard let http = response as? HTTPURLResponse else {
+                        continuation.yield(.error("❌ No HTTP response received"))
+                        continuation.finish()
+                        return
+                    }
+                    guard (200...299).contains(http.statusCode) else {
+                        var errorBody = ""
+                        for try await line in bytes.lines { errorBody += line }
+                        continuation.yield(.error("❌ HTTP \(http.statusCode): \(String(errorBody.prefix(300)))"))
+                        continuation.finish()
+                        return
+                    }
+
+                    var accumulated = ""
+                    var tokenCount = 0
+                    let throttle = 8
+
+                    if provider == .gemini {
+                        var geminiBuffer = ""
+                        for try await line in bytes.lines {
+                            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if trimmed.hasPrefix("data:") {
+                                if !geminiBuffer.isEmpty {
+                                    if let text = parseGeminiChunkSanitized(geminiBuffer) {
+                                        accumulated += text
+                                        tokenCount += 1
+                                        if tokenCount % throttle == 0 { continuation.yield(.text(accumulated)) }
+                                    }
+                                }
+                                geminiBuffer = String(trimmed.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+                            } else if !geminiBuffer.isEmpty {
+                                geminiBuffer += "\n" + line
+                            }
+                        }
+                        if !geminiBuffer.isEmpty, let text = parseGeminiChunkSanitized(geminiBuffer) {
+                            accumulated += text
+                        }
+                    } else {
+                        var parser = SSELineParser()
+                        for try await line in bytes.lines {
+                            if let event = parser.feedLine(line) {
+                                let text: String?
+                                switch provider {
+                                case .openai:   text = parseOpenAIDelta(event.data)
+                                case .anthropic: text = parseAnthropicDelta(event.data, event: event.event)
+                                case .gemini:   text = nil
+                                }
+                                if let t = text {
+                                    accumulated += t
+                                    tokenCount += 1
+                                    if tokenCount % throttle == 0 { continuation.yield(.text(accumulated)) }
+                                }
+                            }
+                        }
+                        if let event = parser.feedLine("") {
+                            let text: String?
+                            switch provider {
+                            case .openai:   text = parseOpenAIDelta(event.data)
+                            case .anthropic: text = parseAnthropicDelta(event.data, event: event.event)
+                            case .gemini:   text = nil
+                            }
+                            if let t = text { accumulated += t }
+                        }
+                    }
+
+                    if accumulated.isEmpty {
+                        continuation.yield(.error("⚠️ No tokens received from \(provider.rawValue)"))
+                    } else {
+                        continuation.yield(.text(accumulated))
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.yield(.error("❌ Stream error: \(error.localizedDescription)"))
+                    continuation.finish()
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
     }
 
     /// Builds a URLRequest for the SSE streaming endpoint based on the provider.
-    private func buildStreamingURLRequest(
+    /// Static so it can be called from Task.detached without capturing self.
+    private static func buildSSERequest(
         systemPrompt: String,
         userContent: String,
         captured: CapturedAISettings,
@@ -524,10 +544,10 @@ struct AIChatView: View {
 
             onAgentActions(actions)
 
-            DispatchQueue.main.asyncAfter(deadline: .now() + 10.0) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15.0) {
                 guard once.tryOnce() else { return }
                 if let obs = observer { NotificationCenter.default.removeObserver(obs) }
-                cont.resume(returning: nil)
+                cont.resume(returning: "Compilation timed out (Metal compiler may be overloaded — try a simpler shader)")
             }
         }
     }
@@ -618,27 +638,34 @@ struct AIChatView: View {
 
     /// Plan Mode: generates a plan, then executes each step sequentially.
     private func sendPlanRequest() {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        print("[CANVAS-SEND] sendPlanRequest START")
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, aiSettings.isConfigured else { return }
         let userImg = pendingUserImage
         var userMsg = ChatMessage(role: .user, content: text)
         userMsg.userImage = userImg
-        messages.append(userMsg)
-        let userMsgIdx = messages.count - 1
+        chatStore.messages.append(userMsg)
+        let userMsgIdx = chatStore.messages.count - 1
         inputText = ""; pendingUserImage = nil; isLoading = true; errorMessage = nil; streamingThinking = ""
+        print("[CANVAS-SEND] state mutations done  +\(Int((CFAbsoluteTimeGetCurrent()-t0)*1000))ms")
         let context = buildContext()
         let dataFlowDesc = buildDataFlowDescription()
         let captured = aiSettings.captured
+        print("[CANVAS-SEND] context built, handleSubmit END (Task scheduled)  +\(Int((CFAbsoluteTimeGetCurrent()-t0)*1000))ms")
         Task {
+            print("[CANVAS-SEND] Task body START  +\(Int((CFAbsoluteTimeGetCurrent()-t0)*1000))ms")
             let snapshot = await Task.detached { MetalRenderer.current?.captureForAI() }.value
-            messages[userMsgIdx].renderSnapshot = snapshot
+            chatStore.messages[userMsgIdx].renderSnapshot = snapshot
             let combinedImage = userImg ?? snapshot
             do {
                 // Phase 1: Stream plan generation — direct SSE, no actor crossings
                 let accumulated = await streamDirectSSE(
-                    systemPrompt: await AIService.shared.buildPlanSystemPrompt(
-                        request: text, context: context, dataFlowDescription: dataFlowDesc
-                    ),
+                    systemPrompt: await AIService.onBackground {
+                        await AIService.shared.buildPlanSystemPrompt(
+                            request: text, context: context, dataFlowDescription: dataFlowDesc
+                        )
+                    },
                     userContent: text,
                     captured: captured,
                     imageData: combinedImage
@@ -647,16 +674,20 @@ struct AIChatView: View {
                 let plan: AgentPlan
                 if accumulated.isEmpty {
                     streamingThinking = "⏳ Streaming failed, retrying with non-streaming API..."
-                    plan = try await AIService.shared.generatePlan(
-                        request: text, context: context,
-                        dataFlowDescription: dataFlowDesc,
-                        canvasMode: canvasMode, settings: aiSettings,
-                        imageData: combinedImage
-                    )
+                    plan = try await AIService.onBackground {
+                        try await AIService.shared.generatePlan(
+                            request: text, context: context,
+                            dataFlowDescription: dataFlowDesc,
+                            canvasMode: canvasMode, settings: aiSettings,
+                            imageData: combinedImage
+                        )
+                    }
                     streamingThinking = ""
                 } else {
                     streamingThinking = "⏳ Parsing plan..."
-                    plan = try await AIService.shared.parsePlanResponse(from: accumulated)
+                    plan = try await AIService.onBackground {
+                        try await AIService.shared.parsePlanResponse(from: accumulated)
+                    }
                     streamingThinking = ""
                 }
 
@@ -664,7 +695,7 @@ struct AIChatView: View {
                     currentPlan = plan
                     var planMsg = ChatMessage(role: .assistant, content: "Plan generated: \(plan.title)")
                     planMsg.plan = plan
-                    messages.append(planMsg)
+                    chatStore.messages.append(planMsg)
                 }
                 await executePlan(plan, context: context, dataFlowDesc: dataFlowDesc)
                 await MainActor.run { isLoading = false }
@@ -714,21 +745,21 @@ struct AIChatView: View {
                 var summaryMsg = ChatMessage(role: .assistant,
                     content: "✓ \(mutablePlan.title) — all \(mutablePlan.totalSteps) steps completed.")
                 summaryMsg.plan = mutablePlan
-                messages.append(summaryMsg)
+                chatStore.messages.append(summaryMsg)
             } else {
                 var summaryText = "⚠️ \(mutablePlan.title) — \(completedNodes.count)/\(mutablePlan.totalSteps) steps succeeded, \(failedNodes.count) failed.\n"
                 summaryText += "\nIf you'd like, you can describe the issue differently or break it into simpler steps and I'll try again."
                 var summaryMsg = ChatMessage(role: .assistant, content: summaryText)
                 summaryMsg.plan = mutablePlan
-                messages.append(summaryMsg)
+                chatStore.messages.append(summaryMsg)
             }
         }
     }
 
     /// Updates the plan object in the original plan message for live progress display.
     private func updatePlanInMessages(_ plan: AgentPlan) {
-        if let idx = messages.lastIndex(where: { $0.plan?.id == plan.id }) {
-            messages[idx].plan = plan
+        if let idx = chatStore.messages.lastIndex(where: { $0.plan?.id == plan.id }) {
+            chatStore.messages[idx].plan = plan
         }
     }
 
@@ -757,11 +788,13 @@ struct AIChatView: View {
             let freshContext = await MainActor.run { buildContext() }
             let captured = await MainActor.run { aiSettings.captured }
 
-            let stepSystemPrompt = await AIService.shared.buildStepSystemPrompt(
-                node: plan.nodes[i], context: freshContext,
-                dataFlowDescription: dataFlowDesc,
-                canvasMode: canvasMode, handoffSummary: handoffSummary
-            )
+            let stepSystemPrompt = await AIService.onBackground {
+                await AIService.shared.buildStepSystemPrompt(
+                    node: plan.nodes[i], context: freshContext,
+                    dataFlowDescription: dataFlowDesc,
+                    canvasMode: canvasMode, handoffSummary: handoffSummary
+                )
+            }
             let stepUserContent = "Execute plan step: \(plan.nodes[i].title)\n\(plan.nodes[i].description)"
 
             let accumulated = await streamDirectSSE(
@@ -774,16 +807,20 @@ struct AIChatView: View {
             let response: AgentResponse
             if accumulated.isEmpty {
                 streamingThinking = "⏳ Retrying step with non-streaming API..."
-                response = try await AIService.shared.executePlanStep(
-                    node: plan.nodes[i], context: freshContext,
-                    dataFlowDescription: dataFlowDesc, canvasMode: canvasMode,
-                    settings: aiSettings, handoffSummary: handoffSummary,
-                    imageData: snapshot
-                )
+                response = try await AIService.onBackground {
+                    try await AIService.shared.executePlanStep(
+                        node: plan.nodes[i], context: freshContext,
+                        dataFlowDescription: dataFlowDesc, canvasMode: canvasMode,
+                        settings: aiSettings, handoffSummary: handoffSummary,
+                        imageData: snapshot
+                    )
+                }
                 streamingThinking = ""
             } else {
                 do {
-                    response = try await AIService.shared.parseAgentResponse(from: accumulated)
+                    response = try await AIService.onBackground {
+                        try await AIService.shared.parseAgentResponse(from: accumulated)
+                    }
                 } catch {
                     response = AgentResponse.plainText(accumulated)
                 }
@@ -797,7 +834,7 @@ struct AIChatView: View {
                     plan.nodes[i].status = .completed
                     var msg = ChatMessage(role: .assistant, content: "✓ \(stepTitle): \(response.explanation)")
                     msg.thinking = response.thinking
-                    messages.append(msg)
+                    chatStore.messages.append(msg)
                 }
                 return StepResult(succeeded: true, handoff: nil)
             }
@@ -809,7 +846,7 @@ struct AIChatView: View {
                 await MainActor.run {
                     plan.nodes[i].status = .failed
                     plan.nodes[i].error = "Shape lock denied by user"
-                    messages.append(ChatMessage(role: .assistant,
+                    chatStore.messages.append(ChatMessage(role: .assistant,
                         content: "✗ \(stepTitle): Shape lock was denied — edge-aware effects require a locked shape."))
                 }
                 return StepResult(succeeded: false, handoff: nil)
@@ -832,14 +869,14 @@ struct AIChatView: View {
                     await MainActor.run {
                         plan.nodes[i].status = .failed
                         plan.nodes[i].error = analysis
-                        messages.append(ChatMessage(role: .assistant,
+                        chatStore.messages.append(ChatMessage(role: .assistant,
                             content: "✗ \(stepTitle)\n\n\(analysis)"))
                     }
                     return StepResult(succeeded: false, handoff: nil)
                 }
 
                 await MainActor.run {
-                    messages.append(ChatMessage(role: .assistant,
+                    chatStore.messages.append(ChatMessage(role: .assistant,
                         content: "🔧 \(stepTitle): Compilation error auto-fixed."))
                 }
             }
@@ -875,11 +912,13 @@ struct AIChatView: View {
                     ? "\nThe screenshot shows ONLY the AI-generated preview object rendered in isolation. Evaluate whether it matches the step goal."
                     : ""
                 do {
-                    let result = try await AIService.shared.verifyStepResult(
-                        stepTitle: stepTitle, stepDescription: stepDesc + verifyHint,
-                        screenshot: verifyData, context: verifyContext,
-                        canvasMode: canvasMode, settings: aiSettings
-                    )
+                    let result = try await AIService.onBackground {
+                        try await AIService.shared.verifyStepResult(
+                            stepTitle: stepTitle, stepDescription: stepDesc + verifyHint,
+                            screenshot: verifyData, context: verifyContext,
+                            canvasMode: canvasMode, settings: aiSettings
+                        )
+                    }
                     if !result.passed {
                         verificationNote = "\n⚠️ Visual check: \(result.feedback)"
                         let fixContext = await MainActor.run { buildContext() }
@@ -887,12 +926,14 @@ struct AIChatView: View {
                             "\n\n--- VISUAL VERIFICATION FAILED ---\n\(result.feedback)\nPlease adjust the shader to fix the visual issue.\n"
 
                         do {
-                            let fixResponse = try await AIService.shared.executePlanStep(
-                                node: plan.nodes[i], context: fixContext,
-                                dataFlowDescription: dataFlowDesc, canvasMode: canvasMode,
-                                settings: aiSettings, handoffSummary: fixHandoff,
-                                imageData: verifyData
-                            )
+                            let fixResponse = try await AIService.onBackground {
+                                try await AIService.shared.executePlanStep(
+                                    node: plan.nodes[i], context: fixContext,
+                                    dataFlowDescription: dataFlowDesc, canvasMode: canvasMode,
+                                    settings: aiSettings, handoffSummary: fixHandoff,
+                                    imageData: verifyData
+                                )
+                            }
                             if !fixResponse.actions.isEmpty {
                                 let fixCompError = await applyActionsAndCheckCompilation(fixResponse.actions)
                                 if fixCompError != nil {
@@ -919,7 +960,7 @@ struct AIChatView: View {
                 msg.executedActions = response.actions.isEmpty ? nil : response.actions
                 msg.thinking = response.thinking
                 msg.renderSnapshot = verifySnapshot
-                messages.append(msg)
+                chatStore.messages.append(msg)
             }
 
             let stateChanges = response.actions.map { "\($0.type.rawValue): \($0.name)" }
@@ -938,7 +979,7 @@ struct AIChatView: View {
             await MainActor.run {
                 plan.nodes[i].status = .failed
                 plan.nodes[i].error = analysis
-                messages.append(ChatMessage(role: .assistant,
+                chatStore.messages.append(ChatMessage(role: .assistant,
                     content: "✗ \(stepTitle)\n\n\(analysis)"))
             }
             return StepResult(succeeded: false, handoff: nil)
@@ -966,11 +1007,13 @@ struct AIChatView: View {
         """
         let captured = await MainActor.run { aiSettings.captured }
         do {
-            let analysis = try await AIService.shared.agentChat(
-                messages: [ChatMessage(role: .user, content: "Analyze this failure")],
-                context: prompt, dataFlowDescription: "",
-                canvasMode: canvasMode, settings: aiSettings
-            )
+            let analysis = try await AIService.onBackground {
+                try await AIService.shared.agentChat(
+                    messages: [ChatMessage(role: .user, content: "Analyze this failure")],
+                    context: prompt, dataFlowDescription: "",
+                    canvasMode: canvasMode, settings: aiSettings
+                )
+            }
             return analysis.explanation
         } catch {
             // Fallback: just format the raw error nicely
@@ -1012,7 +1055,7 @@ struct AIChatView: View {
             let (strategyLabel, strategyInstruction) = Self.fixStrategy(attempt: attempt)
 
             await MainActor.run {
-                messages.append(ChatMessage(role: .assistant,
+                chatStore.messages.append(ChatMessage(role: .assistant,
                     content: "🔧 \(stepTitle) — attempt \(attempt) [\(strategyLabel)]:\n\(currentError)"))
             }
 
@@ -1035,12 +1078,14 @@ struct AIChatView: View {
                 """)
 
             do {
-                let response = try await AIService.shared.agentChat(
-                    messages: [fixMsg], context: fixContext,
-                    dataFlowDescription: dataFlowDesc,
-                    canvasMode: canvasMode, settings: aiSettings,
-                    imageData: snapshot
-                )
+                let response = try await AIService.onBackground {
+                    try await AIService.shared.agentChat(
+                        messages: [fixMsg], context: fixContext,
+                        dataFlowDescription: dataFlowDesc,
+                        canvasMode: canvasMode, settings: aiSettings,
+                        imageData: snapshot
+                    )
+                }
 
                 if !response.actions.isEmpty {
                     let newError = await applyActionsAndCheckCompilation(response.actions)
@@ -1050,12 +1095,16 @@ struct AIChatView: View {
                     }
                     currentError = newError!
                     previousErrors.append(currentError)
+
+                    if attempt < maxAttempts {
+                        try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    }
                 } else {
                     return CompileFixResult(fixed: false, lastError: "AI could not produce a fix: \(response.explanation)")
                 }
             } catch {
-                // Network/API errors: don't count as a "real" failure, just retry
                 if attempt < maxAttempts {
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
                     continue
                 }
                 return CompileFixResult(fixed: false, lastError: "Request failed: \(error.localizedDescription)")
@@ -1072,8 +1121,10 @@ struct AIChatView: View {
         let topic = tutorialTopic
         Task {
             do {
-                let steps = try await AIService.shared.generateTutorial(topic: topic, settings: aiSettings)
-                await MainActor.run { isTutorialLoading = false; messages.append(ChatMessage(role: .assistant, content: "Tutorial \"\(topic)\" generated (\(steps.count) steps). Loading...")); onGenerateTutorial(steps) }
+                let steps = try await AIService.onBackground {
+                    try await AIService.shared.generateTutorial(topic: topic, settings: aiSettings)
+                }
+                await MainActor.run { isTutorialLoading = false; chatStore.messages.append(ChatMessage(role: .assistant, content: "Tutorial \"\(topic)\" generated (\(steps.count) steps). Loading...")); onGenerateTutorial(steps) }
             } catch {
                 await MainActor.run { isTutorialLoading = false; errorMessage = error.localizedDescription }
             }
@@ -1087,19 +1138,21 @@ struct AIChatView: View {
             ? "REWRITE the shader from scratch (previous fix attempts failed)"
             : "fix the compilation error"
         let errorMsg = "⚠️ Shader Compilation Error (attempt \(autoFixAttempts)/\(maxAutoFixAttempts), strategy: \(strategy)):\n\(error)"
-        messages.append(ChatMessage(role: .user, content: errorMsg))
+        chatStore.messages.append(ChatMessage(role: .user, content: errorMsg))
         isLoading = true; errorMessage = nil
         let context = buildContext()
         let dataFlowDesc = buildDataFlowDescription()
         Task {
             let snapshot = await Task.detached { MetalRenderer.current?.captureForAI() }.value
             do {
-                let response = try await AIService.shared.agentChat(
-                    messages: messages, context: context,
-                    dataFlowDescription: dataFlowDesc,
-                    canvasMode: canvasMode, settings: aiSettings,
-                    imageData: snapshot
-                )
+                let response = try await AIService.onBackground {
+                    try await AIService.shared.agentChat(
+                        messages: chatStore.messages, context: context,
+                        dataFlowDescription: dataFlowDesc,
+                        canvasMode: canvasMode, settings: aiSettings,
+                        imageData: snapshot
+                    )
+                }
                 await MainActor.run {
                     if !response.actions.isEmpty {
                         onAgentActions(response.actions)
@@ -1109,7 +1162,7 @@ struct AIChatView: View {
                     msg.executedActions = response.actions.isEmpty ? nil : response.actions
                     msg.barriers = response.canFulfill ? nil : response.barriers
                     msg.thinking = response.thinking
-                    messages.append(msg)
+                    chatStore.messages.append(msg)
                     isLoading = false
                 }
             } catch {
@@ -1281,6 +1334,8 @@ struct MessageBubble: View {
             return "✓ Set \(action.category.capitalized) on \"\(action.targetObjectName ?? action.name)\""
         case .requestShapeLock:
             return "🔒 Shape Lock Requested: \"\(action.targetObjectName ?? action.name)\""
+        case .enableDataFlow:
+            return "✓ Enabled DataFlow: \(action.code)"
         }
     }
 }

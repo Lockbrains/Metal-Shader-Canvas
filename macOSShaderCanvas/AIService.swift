@@ -38,6 +38,22 @@ actor AIService {
     /// Singleton instance. Use `await AIService.shared.chat(...)`.
     static let shared = AIService()
 
+    /// Forces an async operation onto a background thread via Task.detached.
+    /// Prevents the MainActor from blocking when awaiting actor methods —
+    /// Swift's cooperative executor can inline actor calls on the caller's
+    /// thread, which freezes the UI when the caller is the MainActor.
+    nonisolated static func onBackground<T: Sendable>(
+        _ work: @Sendable @escaping () async throws -> T
+    ) async throws -> T {
+        try await Task.detached(operation: work).value
+    }
+
+    nonisolated static func onBackground<T: Sendable>(
+        _ work: @Sendable @escaping () async -> T
+    ) async -> T {
+        await Task.detached(operation: work).value
+    }
+
     private let session: URLSession = {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 300
@@ -58,15 +74,23 @@ actor AIService {
     /// - Technical barriers if the request cannot be fulfilled
     ///
     /// Falls back to plain text if the model's response cannot be parsed as JSON.
-    func agentChat(messages: [ChatMessage], context: String, dataFlowDescription: String, canvasMode: CanvasMode = .threeDimensional, settings: AISettings, imageData: Data? = nil) async throws -> AgentResponse {
+    func agentChat(messages: [ChatMessage], context: String, dataFlowDescription: String, canvasMode: CanvasMode = .threeDimensional, settings: AISettings, imageData: Data? = nil, additionalImages: [Data] = []) async throws -> AgentResponse {
+        print("[ACTOR] agentChat ENTERED  isMainThread=\(Thread.isMainThread)  msgs=\(messages.count)  imgs=\(additionalImages.count)  imgData=\(imageData?.count ?? 0)")
         let systemPrompt = canvasMode.is2D
             ? build2DSystemPrompt(context: context, dataFlowDescription: dataFlowDescription)
             : build3DSystemPrompt(context: context, dataFlowDescription: dataFlowDescription)
+        print("[ACTOR] systemPrompt built  len=\(systemPrompt.count)")
         let rawResponse: String
         switch settings.selectedProvider {
-        case .openai:   rawResponse = try await callOpenAI(system: systemPrompt, messages: messages, settings: settings, imageData: imageData)
-        case .anthropic: rawResponse = try await callAnthropic(system: systemPrompt, messages: messages, settings: settings, imageData: imageData)
-        case .gemini:   rawResponse = try await callGemini(system: systemPrompt, messages: messages, settings: settings, imageData: imageData)
+        case .openai:
+            print("[ACTOR] BEFORE callOpenAI")
+            rawResponse = try await callOpenAI(system: systemPrompt, messages: messages, settings: settings, imageData: imageData, additionalImages: additionalImages)
+        case .anthropic:
+            print("[ACTOR] BEFORE callAnthropic")
+            rawResponse = try await callAnthropic(system: systemPrompt, messages: messages, settings: settings, imageData: imageData, additionalImages: additionalImages)
+        case .gemini:
+            print("[ACTOR] BEFORE callGemini")
+            rawResponse = try await callGemini(system: systemPrompt, messages: messages, settings: settings, imageData: imageData, additionalImages: additionalImages)
         }
         do {
             return try parseAgentResponse(from: rawResponse)
@@ -148,6 +172,13 @@ actor AIService {
           "shaderCode" = specific shader layer code
           "compilationResult" = result of previous compilation
           "paramValues" = current parameter values
+
+        DATA FLOW REQUIREMENT (3D mode):
+        If the shader needs VertexOut fields that are NOT currently enabled in the DATA FLOW
+        section below (e.g. worldPosition → positionWS, worldNormal → normalWS, viewDirection → viewDirWS),
+        the plan MUST include an "Enable DataFlow" step as the FIRST step, BEFORE any shader step
+        that uses those fields. This step uses an enableDataFlow action to activate the required fields
+        so the VertexOut struct includes them and the default vertex shader populates them.
 
         SHAPE LOCK REQUIREMENT (2D mode):
         If the request involves ANY edge-aware effects (edge glow, rim light, inner shadow,
@@ -382,6 +413,18 @@ actor AIService {
         Set "barriers" to null when canFulfill is true. Set "actions" to [] when no layer changes are needed.
         For modifying existing layers, use type "modifyLayer" with additional field "targetLayerName" (exact name of the existing layer).
 
+        ENABLING DATA FLOW FIELDS:
+        If your shader needs VertexOut fields that are NOT currently enabled (see DATA FLOW below),
+        you MUST include an "enableDataFlow" action BEFORE any shader action that uses those fields.
+        Format: { "type": "enableDataFlow", "name": "Enable DataFlow", "code": "field1,field2,..." }
+        Available 3D field names: normal, uv, time, worldPosition, worldNormal, viewDirection
+        The "code" field is a comma-separated list of field names to enable.
+        Example: { "type": "enableDataFlow", "name": "Enable World Space", "code": "worldPosition,worldNormal,viewDirection" }
+        This ensures the VertexOut struct includes the required fields (positionWS, normalWS, viewDirWS)
+        and the default vertex shader populates them automatically.
+        IMPORTANT: Only use field names listed in DATA FLOW. The VertexOut member names are:
+          worldPosition → positionWS, worldNormal → normalWS, viewDirection → viewDirWS
+
         CURRENT WORKSPACE (3D Mode):
         \(context)
 
@@ -526,6 +569,11 @@ actor AIService {
         IMPORTANT: You MUST send requestShapeLock in a SEPARATE response BEFORE writing any shader code
         that calls _sdf_shape(). Wait for user confirmation first. Do NOT combine requestShapeLock with
         setObjectShader2D in the same response.
+
+        7) Enable Data Flow fields:
+        { "type": "enableDataFlow", "name": "Enable DataFlow", "code": "field1,field2,..." }
+        Enables additional VertexOut fields that your shader needs. Available 2D fields: time, mouse, objectPosition, screenUV
+        Include this BEFORE any shader action that references those fields.
 
         ═══ CRITICAL: USER CONTENT PROTECTION ═══
         ✗ NEVER modify user-created objects. All your work goes into AI preview clones.
@@ -685,7 +733,8 @@ actor AIService {
     // MARK: - Provider Implementations
 
     /// Calls the OpenAI Chat Completions API with optional vision support.
-    func callOpenAI(system: String, messages: [ChatMessage], settings: AISettings, imageData: Data? = nil) async throws -> String {
+    func callOpenAI(system: String, messages: [ChatMessage], settings: AISettings, imageData: Data? = nil, additionalImages: [Data] = []) async throws -> String {
+        print("[API] callOpenAI START  isMainThread=\(Thread.isMainThread)  msgCount=\(messages.count)")
         var req = URLRequest(url: URL(string: "https://api.openai.com/v1/chat/completions")!)
         req.httpMethod = "POST"
         req.setValue("Bearer \(settings.openAIKey)", forHTTPHeaderField: "Authorization")
@@ -694,19 +743,26 @@ actor AIService {
         for (i, m) in messages.enumerated() {
             let role = m.role == .user ? "user" : "assistant"
             let isLastUser = (m.role == .user && i == messages.count - 1)
-            if isLastUser, let img = imageData {
-                let b64 = img.base64EncodedString()
-                let contentArray: [[String: Any]] = [
-                    ["type": "text", "text": m.content],
-                    ["type": "image_url", "image_url": ["url": "data:image/jpeg;base64,\(b64)", "detail": "low"]]
-                ]
+            var allImages: [Data] = []
+            if isLastUser {
+                if let img = imageData { allImages.append(img) }
+                allImages.append(contentsOf: additionalImages)
+            }
+            if !allImages.isEmpty {
+                var contentArray: [[String: Any]] = [["type": "text", "text": m.content]]
+                for img in allImages {
+                    contentArray.append(["type": "image_url", "image_url": ["url": "data:image/jpeg;base64,\(img.base64EncodedString())", "detail": "low"]])
+                }
                 msgs.append(["role": role, "content": contentArray])
             } else {
                 msgs.append(["role": role, "content": m.content])
             }
         }
+        print("[API] callOpenAI request body serializing...")
         req.httpBody = try JSONSerialization.data(withJSONObject: ["model": settings.openAIModel, "messages": msgs, "max_tokens": 4096] as [String: Any])
+        print("[API] callOpenAI BEFORE await session.data  bodySize=\(req.httpBody?.count ?? 0)")
         let (data, resp) = try await session.data(for: req)
+        print("[API] callOpenAI AFTER await session.data")
         try check(resp, data: data, provider: "OpenAI")
         let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
         guard let choices = json?["choices"] as? [[String: Any]], let msg = choices.first?["message"] as? [String: Any], let content = msg["content"] as? String else { throw AIError.invalidResponse("OpenAI") }
@@ -714,7 +770,7 @@ actor AIService {
     }
 
     /// Calls the Anthropic Messages API with optional vision support.
-    func callAnthropic(system: String, messages: [ChatMessage], settings: AISettings, imageData: Data? = nil) async throws -> String {
+    func callAnthropic(system: String, messages: [ChatMessage], settings: AISettings, imageData: Data? = nil, additionalImages: [Data] = []) async throws -> String {
         var req = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
         req.httpMethod = "POST"
         req.setValue(settings.anthropicKey, forHTTPHeaderField: "x-api-key")
@@ -724,12 +780,16 @@ actor AIService {
         for (i, m) in messages.enumerated() {
             let role = m.role == .user ? "user" : "assistant"
             let isLastUser = (m.role == .user && i == messages.count - 1)
-            if isLastUser, let img = imageData {
-                let b64 = img.base64EncodedString()
-                let contentArray: [[String: Any]] = [
-                    ["type": "image", "source": ["type": "base64", "media_type": "image/jpeg", "data": b64]],
-                    ["type": "text", "text": m.content]
-                ]
+            var allImages: [Data] = []
+            if isLastUser {
+                if let img = imageData { allImages.append(img) }
+                allImages.append(contentsOf: additionalImages)
+            }
+            if !allImages.isEmpty {
+                var contentArray: [[String: Any]] = allImages.map { img in
+                    ["type": "image", "source": ["type": "base64", "media_type": "image/jpeg", "data": img.base64EncodedString()]] as [String: Any]
+                }
+                contentArray.append(["type": "text", "text": m.content])
                 msgs.append(["role": role, "content": contentArray])
             } else {
                 msgs.append(["role": role, "content": m.content])
@@ -744,7 +804,7 @@ actor AIService {
     }
 
     /// Calls the Google Gemini generateContent API with optional vision support.
-    func callGemini(system: String, messages: [ChatMessage], settings: AISettings, imageData: Data? = nil) async throws -> String {
+    func callGemini(system: String, messages: [ChatMessage], settings: AISettings, imageData: Data? = nil, additionalImages: [Data] = []) async throws -> String {
         let model = settings.geminiModel
         var req = URLRequest(url: URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent?key=\(settings.geminiKey)")!)
         req.httpMethod = "POST"
@@ -753,12 +813,16 @@ actor AIService {
         for (i, m) in messages.enumerated() {
             let role = m.role == .user ? "user" : "model"
             let isLastUser = (m.role == .user && i == messages.count - 1)
-            if isLastUser, let img = imageData {
-                let b64 = img.base64EncodedString()
-                let parts: [[String: Any]] = [
-                    ["text": m.content],
-                    ["inlineData": ["mimeType": "image/jpeg", "data": b64]]
-                ]
+            var allImages: [Data] = []
+            if isLastUser {
+                if let img = imageData { allImages.append(img) }
+                allImages.append(contentsOf: additionalImages)
+            }
+            if !allImages.isEmpty {
+                var parts: [[String: Any]] = [["text": m.content]]
+                for img in allImages {
+                    parts.append(["inlineData": ["mimeType": "image/jpeg", "data": img.base64EncodedString()]])
+                }
                 contents.append(["role": role, "parts": parts])
             } else {
                 contents.append(["role": role, "parts": [["text": m.content]]])

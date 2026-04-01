@@ -237,12 +237,13 @@ struct AdversarialView: View {
 
         Task {
             do {
+                let capture = await Task.detached { MetalRenderer.current?.captureForAI() }.value
                 let proposal = try await LabAIFlow.proposeAlternative(
                     currentCode: currentCode,
                     paramValues: currentParams,
                     projectDocument: doc,
                     settings: aiSettings,
-                    renderCapture: MetalRenderer.current?.captureForAI()
+                    renderCapture: capture
                 )
                 await MainActor.run {
                     proposals.append(proposal)

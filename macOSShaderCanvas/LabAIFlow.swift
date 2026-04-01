@@ -38,8 +38,11 @@ enum LabAIFlow {
         meshType: MeshType,
         chatHistory: [ChatMessage],
         settings: AISettings,
-        imageData: Data? = nil
+        imageData: Data? = nil,
+        referenceImages: [Data] = []
     ) async throws -> AgentResponse {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        print("[LAB-AI] sendMessage START  isMainThread=\(Thread.isMainThread)")
         let context = buildLabContext(
             phase: phase, references: references, projectDocument: projectDocument,
             activeShaders: activeShaders, canvasMode: canvasMode,
@@ -48,27 +51,38 @@ enum LabAIFlow {
             sharedFragmentCode2D: sharedFragmentCode2D,
             paramValues: paramValues, meshType: meshType
         )
+        print("[LAB-AI] buildLabContext done  +\(Int((CFAbsoluteTimeGetCurrent()-t0)*1000))ms")
 
         let systemPrompt = buildPhasePrompt(phase: phase, context: context)
+        print("[LAB-AI] buildPhasePrompt done  +\(Int((CFAbsoluteTimeGetCurrent()-t0)*1000))ms  phase=\(phase)")
 
         switch phase {
         case .implementation:
-            return try await AIService.shared.agentChat(
-                messages: chatHistory + [ChatMessage(role: .user, content: text)],
-                context: context,
-                dataFlowDescription: buildDataFlowDescription(canvasMode: canvasMode, config3D: dataFlowConfig, config2D: dataFlow2DConfig),
-                canvasMode: canvasMode,
-                settings: settings,
-                imageData: imageData
-            )
+            print("[LAB-AI] BEFORE await agentChat  +\(Int((CFAbsoluteTimeGetCurrent()-t0)*1000))ms")
+            let msgs = chatHistory + [ChatMessage(role: .user, content: text)]
+            let dfDesc = buildDataFlowDescription(canvasMode: canvasMode, config3D: dataFlowConfig, config2D: dataFlow2DConfig)
+            let result = try await AIService.onBackground {
+                try await AIService.shared.agentChat(
+                    messages: msgs, context: context,
+                    dataFlowDescription: dfDesc,
+                    canvasMode: canvasMode, settings: settings,
+                    imageData: imageData, additionalImages: referenceImages
+                )
+            }
+            print("[LAB-AI] AFTER await agentChat  +\(Int((CFAbsoluteTimeGetCurrent()-t0)*1000))ms")
+            return result
         default:
-            return try await sendLabChat(
+            print("[LAB-AI] BEFORE await sendLabChat  +\(Int((CFAbsoluteTimeGetCurrent()-t0)*1000))ms")
+            let result = try await sendLabChat(
                 system: systemPrompt,
                 userMessage: text,
                 chatHistory: chatHistory,
                 settings: settings,
-                imageData: imageData
+                imageData: imageData,
+                referenceImages: referenceImages
             )
+            print("[LAB-AI] AFTER await sendLabChat  +\(Int((CFAbsoluteTimeGetCurrent()-t0)*1000))ms")
+            return result
         }
     }
 
@@ -246,9 +260,9 @@ enum LabAIFlow {
 
     private static func buildDataFlowDescription(canvasMode: CanvasMode, config3D: DataFlowConfig, config2D: DataFlow2DConfig) -> String {
         if canvasMode.is2D {
-            return "2D DataFlow: time=\(config2D.timeEnabled ? "ON" : "OFF") mouse=\(config2D.mouseEnabled ? "ON" : "OFF")"
+            return "2D DataFlow: time=\(config2D.timeEnabled ? "ON" : "OFF") mouse=\(config2D.mouseEnabled ? "ON" : "OFF") objectPosition=\(config2D.objectPositionEnabled ? "ON" : "OFF") screenUV=\(config2D.screenUVEnabled ? "ON" : "OFF")"
         }
-        return "3D DataFlow: normal=\(config3D.normalEnabled ? "ON" : "OFF") uv=\(config3D.uvEnabled ? "ON" : "OFF") time=\(config3D.timeEnabled ? "ON" : "OFF")"
+        return "3D DataFlow: normal=\(config3D.normalEnabled ? "ON" : "OFF") uv=\(config3D.uvEnabled ? "ON" : "OFF") time=\(config3D.timeEnabled ? "ON" : "OFF") worldPosition=\(config3D.worldPositionEnabled ? "ON" : "OFF") worldNormal=\(config3D.worldNormalEnabled ? "ON" : "OFF") viewDirection=\(config3D.viewDirectionEnabled ? "ON" : "OFF")"
     }
 
     // MARK: - Generic Lab Chat (non-implementation phases)
@@ -256,20 +270,25 @@ enum LabAIFlow {
     private static func sendLabChat(
         system: String, userMessage: String,
         chatHistory: [ChatMessage], settings: AISettings,
-        imageData: Data?
+        imageData: Data?,
+        referenceImages: [Data] = []
     ) async throws -> AgentResponse {
         let messages = chatHistory + [ChatMessage(role: .user, content: userMessage)]
-        let rawResponse: String
-        switch settings.selectedProvider {
-        case .openai:
-            rawResponse = try await AIService.shared.callOpenAI(
-                system: system, messages: messages, settings: settings, imageData: imageData)
-        case .anthropic:
-            rawResponse = try await AIService.shared.callAnthropic(
-                system: system, messages: messages, settings: settings, imageData: imageData)
-        case .gemini:
-            rawResponse = try await AIService.shared.callGemini(
-                system: system, messages: messages, settings: settings, imageData: imageData)
+        let rawResponse: String = try await AIService.onBackground {
+            switch settings.selectedProvider {
+            case .openai:
+                return try await AIService.shared.callOpenAI(
+                    system: system, messages: messages, settings: settings,
+                    imageData: imageData, additionalImages: referenceImages)
+            case .anthropic:
+                return try await AIService.shared.callAnthropic(
+                    system: system, messages: messages, settings: settings,
+                    imageData: imageData, additionalImages: referenceImages)
+            case .gemini:
+                return try await AIService.shared.callGemini(
+                    system: system, messages: messages, settings: settings,
+                    imageData: imageData, additionalImages: referenceImages)
+            }
         }
         return AgentResponse.plainText(rawResponse)
     }
@@ -292,20 +311,21 @@ enum LabAIFlow {
         """
 
         let msg = ChatMessage(role: .user, content: prompt)
-        let rawResponse: String
-        switch settings.selectedProvider {
-        case .openai:
-            rawResponse = try await AIService.shared.callOpenAI(
-                system: "You are a shader development visual analyst.", messages: [msg],
-                settings: settings, imageData: firstImage)
-        case .anthropic:
-            rawResponse = try await AIService.shared.callAnthropic(
-                system: "You are a shader development visual analyst.", messages: [msg],
-                settings: settings, imageData: firstImage)
-        case .gemini:
-            rawResponse = try await AIService.shared.callGemini(
-                system: "You are a shader development visual analyst.", messages: [msg],
-                settings: settings, imageData: firstImage)
+        let rawResponse: String = try await AIService.onBackground {
+            switch settings.selectedProvider {
+            case .openai:
+                return try await AIService.shared.callOpenAI(
+                    system: "You are a shader development visual analyst.", messages: [msg],
+                    settings: settings, imageData: firstImage)
+            case .anthropic:
+                return try await AIService.shared.callAnthropic(
+                    system: "You are a shader development visual analyst.", messages: [msg],
+                    settings: settings, imageData: firstImage)
+            case .gemini:
+                return try await AIService.shared.callGemini(
+                    system: "You are a shader development visual analyst.", messages: [msg],
+                    settings: settings, imageData: firstImage)
+            }
         }
         return rawResponse
     }
@@ -336,20 +356,21 @@ enum LabAIFlow {
         """
 
         let msg = ChatMessage(role: .user, content: prompt)
-        let rawResponse: String
-        switch settings.selectedProvider {
-        case .openai:
-            rawResponse = try await AIService.shared.callOpenAI(
-                system: "You are an adversarial shader reviewer.", messages: [msg],
-                settings: settings, imageData: renderCapture)
-        case .anthropic:
-            rawResponse = try await AIService.shared.callAnthropic(
-                system: "You are an adversarial shader reviewer.", messages: [msg],
-                settings: settings, imageData: renderCapture)
-        case .gemini:
-            rawResponse = try await AIService.shared.callGemini(
-                system: "You are an adversarial shader reviewer.", messages: [msg],
-                settings: settings, imageData: renderCapture)
+        let rawResponse: String = try await AIService.onBackground {
+            switch settings.selectedProvider {
+            case .openai:
+                return try await AIService.shared.callOpenAI(
+                    system: "You are an adversarial shader reviewer.", messages: [msg],
+                    settings: settings, imageData: renderCapture)
+            case .anthropic:
+                return try await AIService.shared.callAnthropic(
+                    system: "You are an adversarial shader reviewer.", messages: [msg],
+                    settings: settings, imageData: renderCapture)
+            case .gemini:
+                return try await AIService.shared.callGemini(
+                    system: "You are an adversarial shader reviewer.", messages: [msg],
+                    settings: settings, imageData: renderCapture)
+            }
         }
 
         return AdversarialProposal(

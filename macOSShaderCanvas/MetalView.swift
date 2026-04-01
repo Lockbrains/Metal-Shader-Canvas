@@ -216,6 +216,7 @@ struct MetalView: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: MTKView, context: Context) {
+        print("[DIAG] MetalView.updateNSView CALLED  \(CFAbsoluteTimeGetCurrent())")
         guard let renderer = context.coordinator.renderer else { return }
         let coord = context.coordinator
 
@@ -226,6 +227,7 @@ struct MetalView: NSViewRepresentable {
         renderer.canvasMode = canvasMode
         renderer.shape2DType = shape2DType
 
+        var force2D = false
         if canvasMode.is2D {
             renderer.objects2D = objects2D
             renderer.sharedVertexCode2D = sharedVertexCode2D
@@ -235,7 +237,7 @@ struct MetalView: NSViewRepresentable {
             renderer.dataFlow2DConfig = dataFlow2DConfig
 
             if coord.needs2DPipelineUpdate(objects: objects2D, sharedVS: sharedVertexCode2D, sharedFS: sharedFragmentCode2D, dataFlow2D: dataFlow2DConfig) {
-                renderer.compileObject2DPipelines()
+                force2D = true
                 coord.cache2DState(objects: objects2D, sharedVS: sharedVertexCode2D, sharedFS: sharedFragmentCode2D, dataFlow2D: dataFlow2DConfig)
             }
 
@@ -249,9 +251,10 @@ struct MetalView: NSViewRepresentable {
             }
         }
 
-        // Heavy update — only when shader code or data flow config changed.
-        if coord.needsShaderUpdate(shaders: activeShaders, dataFlow: dataFlowConfig) {
-            renderer.updateShaders(activeShaders, dataFlow: dataFlowConfig, in: nsView)
+        // Heavy update — shader code, data flow, or 2D object state changed.
+        // Routes all compilation through updateShaders for epoch coordination.
+        if force2D || coord.needsShaderUpdate(shaders: activeShaders, dataFlow: dataFlowConfig) {
+            renderer.updateShaders(activeShaders, dataFlow: dataFlowConfig, in: nsView, force2DCompile: force2D)
             coord.cacheShaderState(shaders: activeShaders, dataFlow: dataFlowConfig)
         }
 

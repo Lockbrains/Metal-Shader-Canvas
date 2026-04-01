@@ -30,6 +30,17 @@ import SwiftUI
 import UniformTypeIdentifiers
 import simd
 
+// MARK: - Canvas Chat State Container
+
+/// Isolates chat message mutations from ContentView's body evaluation.
+/// Without this, every `messages.append` re-evaluates the entire ContentView
+/// body — including MetalView (NSViewRepresentable), which triggers
+/// `updateNSView` and blocks the main thread.
+@Observable
+class CanvasChatStore {
+    var messages: [ChatMessage] = []
+}
+
 // MARK: - ContentView
 
 /// The root view of the application. Manages all UI panels and app state.
@@ -138,7 +149,7 @@ struct ContentView: View {
     @State private var aiSettings = AISettings()
     @State private var showingAISettings = false
     @State private var isAIChatActive = false
-    @State private var chatMessages: [ChatMessage] = []
+    @State private var chatStore = CanvasChatStore()
 
     // MARK: - Shape Lock State
 
@@ -182,6 +193,7 @@ struct ContentView: View {
     // MARK: - Body
 
     var body: some View {
+        let _ = print("[DIAG] ContentView.body EVALUATED  \(CFAbsoluteTimeGetCurrent())")
         canvasMainLayout
             .modifier(CanvasLifecycleModifier(
                 canvasMode: appState.canvasMode,
@@ -666,7 +678,7 @@ struct ContentView: View {
                 HStack(spacing: 0) {
                     Spacer()
                     AIChatView(
-                        messages: $chatMessages,
+                        chatStore: chatStore,
                         isActive: $isAIChatActive,
                         activeShaders: activeShaders,
                         aiSettings: aiSettings,
@@ -848,6 +860,8 @@ struct ContentView: View {
     /// `requestShapeLock` actions trigger a confirmation alert rather than
     /// executing immediately.
     private func executeAgentActions(_ actions: [AgentAction]) {
+        applyDataFlowActions(actions)
+
         let result = CanvasActions.executeAgentActions(
             actions,
             activeShaders: &activeShaders,
@@ -871,6 +885,36 @@ struct ContentView: View {
         } else if let id = result.firstObjectID {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
                 withAnimation { selectedObjectID = id }
+            }
+        }
+    }
+
+    /// Processes `enableDataFlow` actions by parsing comma-separated field names
+    /// from `action.code` and enabling the corresponding DataFlow toggles.
+    private func applyDataFlowActions(_ actions: [AgentAction]) {
+        for action in actions where action.type == .enableDataFlow {
+            let fields = Set(
+                action.code
+                    .split(separator: ",")
+                    .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+            )
+            if canvasMode.is2D {
+                var cfg = dataFlow2DConfig
+                if fields.contains("time") { cfg.timeEnabled = true }
+                if fields.contains("mouse") { cfg.mouseEnabled = true }
+                if fields.contains("objectposition") { cfg.objectPositionEnabled = true }
+                if fields.contains("screenuv") { cfg.screenUVEnabled = true }
+                if cfg != dataFlow2DConfig { dataFlow2DConfig = cfg }
+            } else {
+                var cfg = dataFlowConfig
+                if fields.contains("normal") { cfg.normalEnabled = true }
+                if fields.contains("uv") { cfg.uvEnabled = true }
+                if fields.contains("time") { cfg.timeEnabled = true }
+                if fields.contains("worldposition") { cfg.worldPositionEnabled = true }
+                if fields.contains("worldnormal") { cfg.worldNormalEnabled = true }
+                if fields.contains("viewdirection") { cfg.viewDirectionEnabled = true }
+                cfg.resolveDependencies()
+                if cfg != dataFlowConfig { dataFlowConfig = cfg }
             }
         }
     }
@@ -1461,7 +1505,9 @@ struct ContentView: View {
         .glassEffect(.regular.tint(Color(white: 0.15)), in: .rect(cornerRadius: 12))
         .transition(.move(edge: .leading).combined(with: .opacity))
         .onChange(of: dataFlowConfig) { _ in
-            dataFlowConfig.resolveDependencies()
+            var resolved = dataFlowConfig
+            resolved.resolveDependencies()
+            if resolved != dataFlowConfig { dataFlowConfig = resolved }
         }
     }
     

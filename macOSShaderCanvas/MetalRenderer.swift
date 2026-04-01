@@ -183,17 +183,44 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     /// Per-object compiled pipeline (VS distort + FS color + SDF mask, single pass).
     var object2DPipelineStates: [UUID: MTLRenderPipelineState] = [:]
 
+    /// Per-object parsed params, cached at compile time so `draw(in:)` never runs regex.
+    private var object2DParams: [UUID: [ShaderParam]] = [:]
+
     /// Serial queue for all Metal library compilation, preventing concurrent
     /// `makeLibrary(source:)` calls that contend for the driver's file lock.
     private let compileQueue = DispatchQueue(label: "com.shadercanvas.compile", qos: .userInitiated)
     /// Monotonic counter incremented on each compilation request; stale results
     /// whose generation doesn't match are discarded on the main thread.
     private var compileGeneration: UInt64 = 0
+    private var meshCompileGeneration: UInt64 = 0
+    private var fullscreenCompileGeneration: UInt64 = 0
+
+    /// Epoch + pending count for coordinating the single `.shaderCompilationResult`
+    /// notification across parallel mesh / fullscreen compilations triggered by
+    /// a single `updateShaders` call. Only the last compilation to finish in an
+    /// epoch posts the notification, carrying the worst error (if any).
+    private var compilationEpoch: UInt64 = 0
+    private var pendingInEpoch = 0
+    private var worstErrorInEpoch: String?
+
+    /// Tracks transient Metal daemon failures. When consecutive failures exceed
+    /// the threshold, compilation is paused (cooldown) to let the daemon recover
+    /// instead of hammering it with requests that worsen flock contention.
+    private var consecutiveTransientFailures = 0
+    private var cooldownUntil: Date = .distantPast
+    private let transientFailureThreshold = 3
+    private let cooldownDuration: TimeInterval = 3.0
 
     /// Limits the number of in-flight GPU frames to prevent `view.currentDrawable`
     /// from blocking the main thread when the Metal driver is in a degraded state
     /// (e.g. after "Compiler failed to build request").
     private let frameSemaphore = DispatchSemaphore(value: 3)
+
+    /// Counts consecutive frames skipped due to frameSemaphore exhaustion.
+    /// When the threshold is reached, the semaphore is force-reset to recover
+    /// from GPU hangs where `addCompletedHandler` never fires.
+    private var consecutiveDroppedFrames = 0
+    private let droppedFrameRecoveryThreshold = 180
 
     /// Pipeline for the 2D grid background (compiled once).
     var gridPipelineState: MTLRenderPipelineState?
@@ -232,7 +259,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         didSet {
             if currentMeshType != oldValue {
                 setupMesh(type: currentMeshType)
-                compileMeshPipeline()
+                compileMeshPipeline(useEpoch: false)
             }
         }
     }
@@ -374,7 +401,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     /// - Parameters:
     ///   - shaders: The new shader array from SwiftUI state.
     ///   - view: The MTKView, needed for pixel format info during compilation.
-    func updateShaders(_ shaders: [ActiveShader], dataFlow: DataFlowConfig, in view: MTKView) {
+    func updateShaders(_ shaders: [ActiveShader], dataFlow: DataFlowConfig, in view: MTKView, force2DCompile: Bool = false) {
         let oldShaders = self.activeShaders
         let oldDataFlow = self.dataFlowConfig
         self.activeShaders = shaders
@@ -385,18 +412,59 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         let fragmentChanged = shaders.filter({ $0.category == .fragment }).map(\.code) != oldShaders.filter({ $0.category == .fragment }).map(\.code)
         let fullscreenChanged = shaders.filter({ $0.category == .fullscreen }).map({ "\($0.id)\($0.code)" }) != oldShaders.filter({ $0.category == .fullscreen }).map({ "\($0.id)\($0.code)" })
 
+        compilationEpoch &+= 1
+        pendingInEpoch = 0
+        worstErrorInEpoch = nil
+
         if canvasMode.is2D {
-            if fragmentChanged || dataFlowChanged {
+            if force2DCompile || fragmentChanged || dataFlowChanged {
+                pendingInEpoch += 1
                 compileObject2DPipelines()
             }
         } else {
             if vertexChanged || fragmentChanged || dataFlowChanged {
+                pendingInEpoch += 1
                 compileMeshPipeline()
             }
         }
         if fullscreenChanged {
+            pendingInEpoch += 1
             compileFullscreenPipelines(metalView: view)
         }
+
+        if pendingInEpoch == 0 {
+            NotificationCenter.default.post(name: .shaderCompilationResult, object: nil)
+        }
+    }
+
+    /// Called on the main thread when one compilation finishes. Accumulates errors
+    /// and only posts the consolidated `.shaderCompilationResult` notification once
+    /// every compilation dispatched by the current epoch has reported back.
+    /// Also updates the daemon-health tracker for the cooldown mechanism.
+    private func compilationDidFinish(epoch: UInt64, error: String?) {
+        guard epoch == compilationEpoch else { return }
+        if let err = error {
+            worstErrorInEpoch = err
+            let isTransient = err.contains("Compiler failed") || err.contains("failed to build request") || err.contains("timed out")
+            if isTransient {
+                consecutiveTransientFailures += 1
+                if consecutiveTransientFailures >= transientFailureThreshold {
+                    cooldownUntil = Date().addingTimeInterval(cooldownDuration)
+                }
+            }
+        } else {
+            consecutiveTransientFailures = 0
+        }
+        pendingInEpoch -= 1
+        if pendingInEpoch <= 0 {
+            NotificationCenter.default.post(name: .shaderCompilationResult, object: worstErrorInEpoch)
+        }
+    }
+
+    /// Returns true when the Metal daemon is in cooldown after repeated transient
+    /// failures. Callers should skip compilation and post success immediately.
+    private var isDaemonInCooldown: Bool {
+        Date() < cooldownUntil
     }
 
     /// Compiles the mesh rendering pipeline using the Data Flow shared header.
@@ -406,8 +474,16 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     /// 2. For vertex: use user code (stripped of struct defs) or auto-generated default
     /// 3. For fragment: use user code (stripped of struct defs) or built-in default
     /// 4. Prepend header to both, compile, and create the pipeline
-    func compileMeshPipeline() {
+    func compileMeshPipeline(useEpoch: Bool = true) {
         guard let dev = device else { return }
+        if isDaemonInCooldown {
+            NotificationCenter.default.post(name: .shaderCompilationResult,
+                object: "Metal compiler cooling down — skipped compilation")
+            return
+        }
+        meshCompileGeneration &+= 1
+        let expectedGen = meshCompileGeneration
+        let epoch = useEpoch ? compilationEpoch : nil
         let shaders = activeShaders
         let dfConfig = dataFlowConfig
         let currentMesh = mesh
@@ -445,10 +521,26 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         let fSource = header + paramHeader + fBody
         let capturedParams = allParams
 
+        let postResult: (String?) -> Void = { [weak self] error in
+            DispatchQueue.main.async {
+                if let epoch {
+                    self?.compilationDidFinish(epoch: epoch, error: error)
+                } else {
+                    NotificationCenter.default.post(name: .shaderCompilationResult, object: error)
+                }
+            }
+        }
+
         compileQueue.async { [weak self] in
+            if let s = self, expectedGen != s.meshCompileGeneration {
+                postResult(nil)
+                return
+            }
+
             do {
                 let (vFunc, fFunc) = try Self.compileMeshLibrariesWithRetry(
-                    device: dev, vSource: vSource, fSource: fSource)
+                    device: dev, vSource: vSource, fSource: fSource,
+                    isCancelled: { [weak self] in self.map { expectedGen != $0.meshCompileGeneration } ?? true })
 
                 let pipelineDescriptor = MTLRenderPipelineDescriptor()
                 pipelineDescriptor.vertexFunction = vFunc
@@ -462,18 +554,17 @@ class MetalRenderer: NSObject, MTKViewDelegate {
                 }
 
                 let state = try dev.makeRenderPipelineState(descriptor: pipelineDescriptor)
-                DispatchQueue.main.async {
-                    guard let self else { return }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, expectedGen == self.meshCompileGeneration else { return }
                     self.meshParams = capturedParams
                     self.meshPipelineState = state
-                    NotificationCenter.default.post(name: .shaderCompilationResult, object: nil)
+                    postResult(nil)
                 }
+            } catch let e as NSError where e.code == -2 {
+                postResult(nil)
             } catch {
                 let msg = Self.extractMSLErrors(from: "\(error)")
-                Thread.sleep(forTimeInterval: 0.3)
-                DispatchQueue.main.async {
-                    NotificationCenter.default.post(name: .shaderCompilationResult, object: msg)
-                }
+                postResult(msg)
             }
         }
     }
@@ -486,12 +577,21 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     /// for transient Metal compiler daemon failures.
     private static func compileMeshLibrariesWithRetry(
         device dev: MTLDevice, vSource: String, fSource: String,
-        maxRetries: Int = 2
+        maxRetries: Int = 2,
+        isCancelled: () -> Bool = { false }
     ) throws -> (MTLFunction, MTLFunction) {
         var lastError: Error?
         for attempt in 0...maxRetries {
+            if isCancelled() {
+                throw NSError(domain: "ShaderCanvas", code: -2,
+                              userInfo: [NSLocalizedDescriptionKey: "Compilation superseded"])
+            }
             do {
                 let vLib = try dev.makeLibrary(source: vSource, options: nil)
+                if isCancelled() {
+                    throw NSError(domain: "ShaderCanvas", code: -2,
+                                  userInfo: [NSLocalizedDescriptionKey: "Compilation superseded"])
+                }
                 let fLib = try dev.makeLibrary(source: fSource, options: nil)
                 guard let vFunc = vLib.makeFunction(name: "vertex_main"),
                       let fFunc = fLib.makeFunction(name: "fragment_main") else {
@@ -499,14 +599,14 @@ class MetalRenderer: NSObject, MTKViewDelegate {
                                   userInfo: [NSLocalizedDescriptionKey: "Missing vertex_main or fragment_main"])
                 }
                 return (vFunc, fFunc)
+            } catch let e as NSError where e.code == -2 {
+                throw e
             } catch {
                 lastError = error
                 let msg = "\(error)"
                 let isTransient = msg.contains("Compiler failed") || msg.contains("failed to build request")
                 if isTransient && attempt < maxRetries {
-                    let delay = Double(attempt + 1) * 1.0
-                    print("[MetalRenderer] Transient mesh compiler failure (attempt \(attempt+1)/\(maxRetries+1)), retrying in \(delay)s…")
-                    Thread.sleep(forTimeInterval: delay)
+                    Thread.sleep(forTimeInterval: 0.3)
                     continue
                 }
                 throw error
@@ -548,6 +648,14 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     /// - Parameter metalView: The MTKView, needed for pixel format information.
     func compileFullscreenPipelines(metalView: MTKView) {
         guard let dev = device else { return }
+        if isDaemonInCooldown {
+            NotificationCenter.default.post(name: .shaderCompilationResult,
+                object: "Metal compiler cooling down — skipped compilation")
+            return
+        }
+        fullscreenCompileGeneration &+= 1
+        let expectedGen = fullscreenCompileGeneration
+        let epoch = compilationEpoch
         let fullscreenShaders = activeShaders.filter { $0.category == .fullscreen }
 
         struct PreparedShader {
@@ -572,12 +680,25 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         }
 
         compileQueue.async { [weak self] in
+            if let s = self, expectedGen != s.fullscreenCompileGeneration {
+                DispatchQueue.main.async { [weak self] in
+                    self?.compilationDidFinish(epoch: epoch, error: nil)
+                }
+                return
+            }
+
             var newStates: [UUID: MTLRenderPipelineState] = [:]
             var newParams: [UUID: [ShaderParam]] = [:]
             var hasError = false
             var firstError: String?
 
             for item in prepared {
+                if let s = self, expectedGen != s.fullscreenCompileGeneration {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.compilationDidFinish(epoch: epoch, error: nil)
+                    }
+                    return
+                }
                 newParams[item.id] = item.params
                 do {
                     let lib = try dev.makeLibrary(source: item.source, options: nil)
@@ -594,19 +715,14 @@ class MetalRenderer: NSObject, MTKViewDelegate {
                     hasError = true
                     let msg = Self.extractMSLErrors(from: "\(error)")
                     if firstError == nil { firstError = msg }
-                    Thread.sleep(forTimeInterval: 0.3)
                 }
             }
 
-            DispatchQueue.main.async {
-                guard let self else { return }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, expectedGen == self.fullscreenCompileGeneration else { return }
                 self.fullscreenPipelineStates = newStates
                 self.fullscreenParams = newParams
-                if hasError, let errMsg = firstError {
-                    NotificationCenter.default.post(name: .shaderCompilationResult, object: errMsg)
-                } else {
-                    NotificationCenter.default.post(name: .shaderCompilationResult, object: nil)
-                }
+                self.compilationDidFinish(epoch: epoch, error: hasError ? firstError : nil)
             }
         }
     }
@@ -690,8 +806,14 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     /// discard results from superseded compilations.
     func compileObject2DPipelines() {
         guard let dev = device else { return }
+        if isDaemonInCooldown {
+            NotificationCenter.default.post(name: .shaderCompilationResult,
+                object: "Metal compiler cooling down — skipped compilation")
+            return
+        }
         compileGeneration &+= 1
         let expectedGen = compileGeneration
+        let epoch = compilationEpoch
         let objs = objects2D
         let sharedVS = sharedVertexCode2D
         let sharedFS = sharedFragmentCode2D
@@ -699,11 +821,17 @@ class MetalRenderer: NSObject, MTKViewDelegate {
 
         compileQueue.async { [weak self] in
             var newStates: [UUID: MTLRenderPipelineState] = [:]
+            var newParams: [UUID: [ShaderParam]] = [:]
             var hasError = false
             var firstError: String?
 
             for object in objs {
-                if let s = self, expectedGen != s.compileGeneration { return }
+                if let s = self, expectedGen != s.compileGeneration {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.compilationDidFinish(epoch: epoch, error: nil)
+                    }
+                    return
+                }
 
                 let vsUserCode = object.customVertexCode ?? sharedVS
                 let fsUserCode = object.customFragmentCode ?? sharedFS
@@ -718,6 +846,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
                         if seenNames.insert(param.name).inserted { allParams.append(param) }
                     }
                 }
+                newParams[object.id] = allParams
                 let paramHeader = ShaderSnippets.generateParamHeader(params: allParams)
                 let totalParamCount = allParams.count
 
@@ -733,24 +862,26 @@ class MetalRenderer: NSObject, MTKViewDelegate {
 
                 do {
                     let pipeline = try Self.compileObject2DPipelineWithRetry(
-                        device: dev, vsSource: vsSource, fsSource: fsSource)
+                        device: dev, vsSource: vsSource, fsSource: fsSource,
+                        isCancelled: { [weak self] in self.map { expectedGen != $0.compileGeneration } ?? true })
                     newStates[object.id] = pipeline
+                } catch let e as NSError where e.code == -2 {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.compilationDidFinish(epoch: epoch, error: nil)
+                    }
+                    return
                 } catch {
                     hasError = true
                     let msg = Self.extractMSLErrors(from: "\(error)")
                     if firstError == nil { firstError = "[\(object.name)] \(msg)" }
-                    Thread.sleep(forTimeInterval: 0.3)
                 }
             }
 
-            DispatchQueue.main.async {
+            DispatchQueue.main.async { [weak self] in
                 guard let self, expectedGen == self.compileGeneration else { return }
                 self.object2DPipelineStates = newStates
-                if hasError, let errMsg = firstError {
-                    NotificationCenter.default.post(name: .shaderCompilationResult, object: errMsg)
-                } else {
-                    NotificationCenter.default.post(name: .shaderCompilationResult, object: nil)
-                }
+                self.object2DParams = newParams
+                self.compilationDidFinish(epoch: epoch, error: hasError ? firstError : nil)
             }
         }
     }
@@ -761,12 +892,21 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     /// wait and retry the exact same code rather than asking the AI to "fix" it.
     private static func compileObject2DPipelineWithRetry(
         device dev: MTLDevice, vsSource: String, fsSource: String,
-        maxRetries: Int = 2
+        maxRetries: Int = 2,
+        isCancelled: () -> Bool = { false }
     ) throws -> MTLRenderPipelineState {
         var lastError: Error?
         for attempt in 0...maxRetries {
+            if isCancelled() {
+                throw NSError(domain: "ShaderCanvas", code: -2,
+                              userInfo: [NSLocalizedDescriptionKey: "Compilation superseded"])
+            }
             do {
                 let vLib = try dev.makeLibrary(source: vsSource, options: nil)
+                if isCancelled() {
+                    throw NSError(domain: "ShaderCanvas", code: -2,
+                                  userInfo: [NSLocalizedDescriptionKey: "Compilation superseded"])
+                }
                 let fLib = try dev.makeLibrary(source: fsSource, options: nil)
                 guard let vFunc = vLib.makeFunction(name: "vertex_main"),
                       let fFunc = fLib.makeFunction(name: "fragment_main") else {
@@ -779,14 +919,14 @@ class MetalRenderer: NSObject, MTKViewDelegate {
                 desc.colorAttachments[0].pixelFormat = .bgra8Unorm
                 configureAlphaBlending(on: desc.colorAttachments[0])
                 return try dev.makeRenderPipelineState(descriptor: desc)
+            } catch let e as NSError where e.code == -2 {
+                throw e
             } catch {
                 lastError = error
                 let msg = "\(error)"
                 let isTransient = msg.contains("Compiler failed") || msg.contains("failed to build request")
                 if isTransient && attempt < maxRetries {
-                    let delay = Double(attempt + 1) * 1.0
-                    print("[MetalRenderer] Transient compiler failure (attempt \(attempt+1)/\(maxRetries+1)), retrying in \(delay)s…")
-                    Thread.sleep(forTimeInterval: delay)
+                    Thread.sleep(forTimeInterval: 0.3)
                     continue
                 }
                 throw error
@@ -889,10 +1029,17 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     ///
     /// - Parameter view: The MTKView requesting a new frame.
     func draw(in view: MTKView) {
-        // Non-blocking frame gate: if the GPU already has 3 frames in flight
-        // (e.g. the Metal driver stalled after a compiler failure), skip this
-        // frame instead of letting `currentDrawable` block the main thread.
-        guard frameSemaphore.wait(timeout: .now()) == .success else { return }
+        if frameSemaphore.wait(timeout: .now()) != .success {
+            consecutiveDroppedFrames += 1
+            if consecutiveDroppedFrames >= droppedFrameRecoveryThreshold {
+                // GPU likely hung — force-drain and reset the semaphore so
+                // rendering can resume instead of staying permanently black.
+                for _ in 0..<3 { frameSemaphore.signal() }
+                consecutiveDroppedFrames = 0
+            }
+            return
+        }
+        consecutiveDroppedFrames = 0
 
         guard let drawable = view.currentDrawable,
               let commandBuffer = commandQueue.makeCommandBuffer() else {
@@ -1001,17 +1148,8 @@ class MetalRenderer: NSObject, MTKViewDelegate {
                     )
                     encoder.setVertexBytes(&transform, length: MemoryLayout<Transform2D>.stride, index: 3)
 
-                    let vsCode = object.customVertexCode ?? sharedVertexCode2D
-                    let fsCode = object.customFragmentCode ?? sharedFragmentCode2D
-                    var drawParams: [ShaderParam] = []
-                    var drawSeen = Set<String>()
-                    for code in [vsCode, fsCode] {
-                        for p in ShaderSnippets.parseParams(from: code) {
-                            if drawSeen.insert(p.name).inserted { drawParams.append(p) }
-                        }
-                    }
-                    if !drawParams.isEmpty {
-                        var paramBuffer = ShaderSnippets.packParamBuffer(params: drawParams, values: paramValues)
+                    if let cachedParams = object2DParams[object.id], !cachedParams.isEmpty {
+                        var paramBuffer = ShaderSnippets.packParamBuffer(params: cachedParams, values: paramValues)
                         let bufLen = paramBuffer.count * MemoryLayout<Float>.stride
                         encoder.setVertexBytes(&paramBuffer, length: bufLen, index: 2)
                         encoder.setFragmentBytes(&paramBuffer, length: bufLen, index: 2)
@@ -1069,6 +1207,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
                         mouseY: mousePosition.y
                     )
                     encoder.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
+                    encoder.setFragmentBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
 
                     var paramBuffer = ShaderSnippets.packParamBuffer(params: meshParams, values: paramValues)
                     if !paramBuffer.isEmpty {
@@ -1225,18 +1364,28 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     }
 
     /// Renders a single 2D object in isolation and returns a JPEG snapshot.
-    /// Used for multimodal verification so the AI sees only its own output.
+    /// Uses dedicated temporary textures to avoid racing with `draw(in:)`.
     func capturePreviewObject(_ objectID: UUID, maxDimension: Int = 512) -> Data? {
-        guard let object = objects2D.first(where: { $0.id == objectID }),
+        guard let dev = device,
+              let object = objects2D.first(where: { $0.id == objectID }),
               let pipeline = object2DPipelineStates[objectID],
-              let texA = offscreenTextureA,
-              let texB = offscreenTextureB,
+              let refTex = offscreenTextureA else { return nil }
+
+        let w = refTex.width, h = refTex.height
+        guard w > 0, h > 0 else { return nil }
+
+        let texDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm, width: w, height: h, mipmapped: false)
+        texDesc.usage = [.renderTarget, .shaderRead]
+        texDesc.storageMode = .private
+        guard let capTexA = dev.makeTexture(descriptor: texDesc),
+              let capTexB = dev.makeTexture(descriptor: texDesc),
               let cmdBuf = commandQueue.makeCommandBuffer() else { return nil }
 
-        let size = CGSize(width: texA.width, height: texA.height)
+        let size = CGSize(width: w, height: h)
 
         let clearDesc = MTLRenderPassDescriptor()
-        clearDesc.colorAttachments[0].texture = texA
+        clearDesc.colorAttachments[0].texture = capTexA
         clearDesc.colorAttachments[0].loadAction = .clear
         clearDesc.colorAttachments[0].clearColor = MTLClearColor(red: 0.118, green: 0.118, blue: 0.137, alpha: 1.0)
         clearDesc.colorAttachments[0].storeAction = .store
@@ -1255,12 +1404,12 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         }
 
         if let blitEnc = cmdBuf.makeBlitCommandEncoder() {
-            blitEnc.copy(from: texA, to: texB)
+            blitEnc.copy(from: capTexA, to: capTexB)
             blitEnc.endEncoding()
         }
 
         let passDesc = MTLRenderPassDescriptor()
-        passDesc.colorAttachments[0].texture = texA
+        passDesc.colorAttachments[0].texture = capTexA
         passDesc.colorAttachments[0].loadAction = .load
         passDesc.colorAttachments[0].storeAction = .store
 
@@ -1270,7 +1419,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
                                time: time, mouseX: 0, mouseY: 0)
             enc.setVertexBytes(&u, length: MemoryLayout<Uniforms2D>.stride, index: 1)
             enc.setFragmentBytes(&u, length: MemoryLayout<Uniforms2D>.stride, index: 1)
-            enc.setFragmentTexture(texB, index: 0)
+            enc.setFragmentTexture(capTexB, index: 0)
 
             var transform = Transform2D(
                 objectOffset: simd_float2(0, 0),
@@ -1281,17 +1430,8 @@ class MetalRenderer: NSObject, MTKViewDelegate {
             )
             enc.setVertexBytes(&transform, length: MemoryLayout<Transform2D>.stride, index: 3)
 
-            let vsCode = object.customVertexCode ?? sharedVertexCode2D
-            let fsCode = object.customFragmentCode ?? sharedFragmentCode2D
-            var drawParams: [ShaderParam] = []
-            var seen = Set<String>()
-            for code in [vsCode, fsCode] {
-                for p in ShaderSnippets.parseParams(from: code) {
-                    if seen.insert(p.name).inserted { drawParams.append(p) }
-                }
-            }
-            if !drawParams.isEmpty {
-                var buf = ShaderSnippets.packParamBuffer(params: drawParams, values: paramValues)
+            if let cachedParams = object2DParams[objectID], !cachedParams.isEmpty {
+                var buf = ShaderSnippets.packParamBuffer(params: cachedParams, values: paramValues)
                 let len = buf.count * MemoryLayout<Float>.stride
                 enc.setVertexBytes(&buf, length: len, index: 2)
                 enc.setFragmentBytes(&buf, length: len, index: 2)
@@ -1301,9 +1441,11 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         }
 
         cmdBuf.commit()
-        cmdBuf.waitUntilCompleted()
+        let done = DispatchSemaphore(value: 0)
+        cmdBuf.addCompletedHandler { _ in done.signal() }
+        if done.wait(timeout: .now() + .seconds(3)) == .timedOut { return nil }
 
-        guard let snapshot = textureToImage(texA) else { return nil }
+        guard let snapshot = textureToImage(capTexA) else { return nil }
         return compressSnapshot(snapshot, maxDimension: maxDimension)
     }
 
@@ -1324,7 +1466,9 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         blit.synchronize(resource: readable)
         blit.endEncoding()
         buf.commit()
-        buf.waitUntilCompleted()
+        let done = DispatchSemaphore(value: 0)
+        buf.addCompletedHandler { _ in done.signal() }
+        if done.wait(timeout: .now() + .seconds(3)) == .timedOut { return nil }
 
         var bytes = [UInt8](repeating: 0, count: bytesPerRow * h)
         readable.getBytes(&bytes, bytesPerRow: bytesPerRow, from: region, mipmapLevel: 0)
@@ -1394,7 +1538,9 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         blit.synchronize(resource: readable)
         blit.endEncoding()
         cmdBuf.commit()
-        cmdBuf.waitUntilCompleted()
+        let gpuDone = DispatchSemaphore(value: 0)
+        cmdBuf.addCompletedHandler { _ in gpuDone.signal() }
+        if gpuDone.wait(timeout: .now() + .seconds(3)) == .timedOut { return nil }
 
         var bytes = [UInt8](repeating: 0, count: bytesPerRow * h)
         readable.getBytes(&bytes, bytesPerRow: bytesPerRow, from: region, mipmapLevel: 0)

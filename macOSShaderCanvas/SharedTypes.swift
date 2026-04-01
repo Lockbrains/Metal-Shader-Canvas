@@ -588,6 +588,7 @@ enum AgentActionType: String, Codable {
     case setSharedShader2D
     case setObjectShader2D
     case requestShapeLock
+    case enableDataFlow
 }
 
 /// A single action the AI Agent wants to perform on the shader workspace.

@@ -120,6 +120,9 @@ enum CanvasActions {
             case .requestShapeLock:
                 let targetName = action.targetObjectName ?? action.name
                 result.shapeLockRequests.append((objectName: targetName, explanation: action.name))
+
+            case .enableDataFlow:
+                break
             }
         }
 

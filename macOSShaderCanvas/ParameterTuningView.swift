@@ -406,15 +406,20 @@ struct ParameterTuningView: View {
     // MARK: - Actions
 
     private func takeSnapshot() {
-        let capture = MetalRenderer.current?.captureForAI()
-        let snapshot = ParameterSnapshot(
-            paramValues: paramValues,
-            renderCapture: capture,
-            label: snapshotLabel.isEmpty ? "Snapshot \(snapshots.count + 1)" : snapshotLabel,
-            codeHash: activeShaders.map(\.code).joined().hashValue.description
-        )
-        snapshots.append(snapshot)
+        let label = snapshotLabel.isEmpty ? "Snapshot \(snapshots.count + 1)" : snapshotLabel
+        let vals = paramValues
+        let hash = activeShaders.map(\.code).joined().hashValue.description
         snapshotLabel = ""
+        Task {
+            let capture = await Task.detached { MetalRenderer.current?.captureForAI() }.value
+            let snapshot = ParameterSnapshot(
+                paramValues: vals,
+                renderCapture: capture,
+                label: label,
+                codeHash: hash
+            )
+            snapshots.append(snapshot)
+        }
     }
 
     private func restoreSnapshot(_ snapshot: ParameterSnapshot) {
