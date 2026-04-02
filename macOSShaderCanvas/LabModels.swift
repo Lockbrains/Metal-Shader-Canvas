@@ -147,9 +147,15 @@ struct IterationEntry: Identifiable, Codable {
     }
 }
 
-/// The co-authored project specification document.
-/// AI and human collaboratively fill in sections during the Document phase.
+/// Final project documentation — technical specs, implementation details,
+/// parameter documentation for migration/handoff. Pure markdown with
+/// supplementary structured data for backward compatibility.
 struct ProjectDocument: Codable {
+    var markdown: String
+    var lastModified: Date
+
+    // Legacy structured fields — kept for backward compatibility with saved files.
+    // New content goes into `markdown` directly.
     var title: String
     var visualGoal: String
     var referenceAnalysis: String
@@ -158,13 +164,16 @@ struct ProjectDocument: Codable {
     var iterationLog: [IterationEntry]
     var constraints: [String]
 
-    init(title: String = "Untitled Shader Project",
+    init(markdown: String = "",
+         title: String = "Untitled Shader Project",
          visualGoal: String = "",
          referenceAnalysis: String = "",
          technicalApproach: String = "",
          parameterDesign: [ParamSpec] = [],
          iterationLog: [IterationEntry] = [],
          constraints: [String] = []) {
+        self.markdown = markdown
+        self.lastModified = Date()
         self.title = title
         self.visualGoal = visualGoal
         self.referenceAnalysis = referenceAnalysis
@@ -175,8 +184,59 @@ struct ProjectDocument: Codable {
     }
 
     var isEmpty: Bool {
-        visualGoal.isEmpty && referenceAnalysis.isEmpty &&
-        technicalApproach.isEmpty && parameterDesign.isEmpty
+        markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        && visualGoal.isEmpty && referenceAnalysis.isEmpty
+        && technicalApproach.isEmpty && parameterDesign.isEmpty
+    }
+
+    /// Migrates legacy structured fields into a markdown string.
+    /// Called once when loading old documents that have structured data but no markdown.
+    mutating func migrateToMarkdown() {
+        guard markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let hasLegacy = !visualGoal.isEmpty || !referenceAnalysis.isEmpty
+            || !technicalApproach.isEmpty || !parameterDesign.isEmpty
+        guard hasLegacy else { return }
+
+        var md = "# \(title)\n\n"
+        if !visualGoal.isEmpty {
+            md += "## Visual Goal\n\n\(visualGoal)\n\n"
+        }
+        if !referenceAnalysis.isEmpty {
+            md += "## Reference Analysis\n\n\(referenceAnalysis)\n\n"
+        }
+        if !technicalApproach.isEmpty {
+            md += "## Technical Approach\n\n\(technicalApproach)\n\n"
+        }
+        if !parameterDesign.isEmpty {
+            md += "## Parameters\n\n"
+            md += "| Name | Type | Purpose | Default | Range |\n"
+            md += "|------|------|---------|---------|-------|\n"
+            for p in parameterDesign {
+                let def = p.suggestedDefault.map { String(format: "%.2f", $0) }.joined(separator: ", ")
+                let range: String
+                if let mn = p.suggestedMin, let mx = p.suggestedMax {
+                    range = "\(String(format: "%.2f", mn))–\(String(format: "%.2f", mx))"
+                } else {
+                    range = "—"
+                }
+                md += "| \(p.name) | \(p.type.rawValue) | \(p.purpose) | \(def) | \(range) |\n"
+            }
+            md += "\n"
+        }
+        if !constraints.isEmpty {
+            md += "## Constraints\n\n"
+            for c in constraints { md += "- \(c)\n" }
+            md += "\n"
+        }
+        if !iterationLog.isEmpty {
+            md += "## Iteration Log\n\n"
+            for entry in iterationLog {
+                md += "- **\(entry.decision)**: \(entry.description) (\(entry.outcome))\n"
+            }
+            md += "\n"
+        }
+        markdown = md
+        lastModified = Date()
     }
 }
 
@@ -241,6 +301,120 @@ enum ProposalOutcome: String, Codable {
     case accepted
     case rejected
     case partiallyAdopted = "partial"
+}
+
+// MARK: - Design Document
+
+/// Collaborative design plan — records analysis, design thinking, and decisions
+/// made during the conversation. Both AI and human can edit. Pure markdown.
+struct DesignDocument: Codable {
+    var markdown: String
+    var lastModified: Date
+
+    init(markdown: String = "", lastModified: Date = Date()) {
+        self.markdown = markdown
+        self.lastModified = lastModified
+    }
+
+    var isEmpty: Bool { markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+}
+
+// MARK: - Lab Action Types
+
+/// Actions the Lab AI agent can perform beyond Canvas-level shader operations.
+/// These drive document updates, parameter suggestions, and iteration tracking
+/// so the agent actively writes into the project state instead of just chatting.
+nonisolated enum LabActionType: String, Codable, Sendable {
+    case updateDesignDoc
+    case updateProjectDoc
+    case updateDocumentSection // legacy — treated as updateDesignDoc
+    case addParameter
+    case addConstraint
+    case suggestParamChange
+    case logIteration
+}
+
+/// Which section of the ProjectDocument to update (legacy support).
+nonisolated enum DocumentSection: String, Codable, Sendable {
+    case title
+    case visualGoal
+    case referenceAnalysis
+    case technicalApproach
+}
+
+/// A single Lab-level action parsed from the agent's structured JSON response.
+nonisolated struct LabAction: Codable, Sendable {
+    let type: LabActionType
+
+    // updateDesignDoc / updateProjectDoc / updateDocumentSection
+    var section: DocumentSection?
+    var content: String?
+
+    // addParameter
+    var paramName: String?
+    var paramType: String?
+    var paramPurpose: String?
+    var paramDefault: [Float]?
+    var paramMin: Float?
+    var paramMax: Float?
+
+    // addConstraint
+    var constraint: String?
+
+    // suggestParamChange
+    var paramChanges: [String: [Float]]?
+    var changeRationale: String?
+
+    // logIteration
+    var iterationDescription: String?
+    var iterationDecision: String?
+    var iterationOutcome: String?
+
+    var displaySummary: String {
+        switch type {
+        case .updateDesignDoc:
+            return "Update Design Doc"
+        case .updateProjectDoc:
+            return "Update Project Doc"
+        case .updateDocumentSection:
+            return "Update \(section?.rawValue ?? "document")"
+        case .addParameter:
+            return "Add param: \(paramName ?? "?")"
+        case .addConstraint:
+            return "Add constraint"
+        case .suggestParamChange:
+            let keys = paramChanges?.keys.joined(separator: ", ") ?? "?"
+            return "Suggest: \(keys)"
+        case .logIteration:
+            return "Log iteration"
+        }
+    }
+}
+
+/// Structured response from the Lab AI agent. Contains the natural-language
+/// explanation shown in chat, plus optional Lab-level and Canvas-level actions
+/// to execute against the project state.
+nonisolated struct LabAgentResponse: Codable, Sendable {
+    let explanation: String
+    let labActions: [LabAction]
+    let agentActions: [AgentAction]?
+
+    static func plainText(_ text: String) -> LabAgentResponse {
+        LabAgentResponse(explanation: text, labActions: [], agentActions: nil)
+    }
+
+    init(explanation: String, labActions: [LabAction] = [], agentActions: [AgentAction]? = nil) {
+        self.explanation = explanation
+        self.labActions = labActions
+        self.agentActions = agentActions
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        explanation = try container.decodeIfPresent(String.self, forKey: .explanation) ?? ""
+        labActions = try container.decodeIfPresent([LabAction].self, forKey: .labActions) ?? []
+        agentActions = try container.decodeIfPresent([AgentAction].self, forKey: .agentActions)
+    }
 }
 
 // MARK: - Lab Session

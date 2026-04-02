@@ -413,14 +413,18 @@ enum ContextManager {
 
         if !projectDocument.isEmpty {
             ctx += "\nProject Document:\n"
-            if !projectDocument.visualGoal.isEmpty {
-                ctx += "  Visual Goal: \(projectDocument.visualGoal)\n"
-            }
-            if !projectDocument.technicalApproach.isEmpty {
-                ctx += "  Technical Approach: \(projectDocument.technicalApproach)\n"
-            }
-            if !projectDocument.parameterDesign.isEmpty {
-                ctx += "  Parameters: \(projectDocument.parameterDesign.map(\.name).joined(separator: ", "))\n"
+            if !projectDocument.markdown.isEmpty {
+                ctx += projectDocument.markdown.prefix(2000) + "\n"
+            } else {
+                if !projectDocument.visualGoal.isEmpty {
+                    ctx += "  Visual Goal: \(projectDocument.visualGoal)\n"
+                }
+                if !projectDocument.technicalApproach.isEmpty {
+                    ctx += "  Technical Approach: \(projectDocument.technicalApproach)\n"
+                }
+                if !projectDocument.parameterDesign.isEmpty {
+                    ctx += "  Parameters: \(projectDocument.parameterDesign.map(\.name).joined(separator: ", "))\n"
+                }
             }
         }
 

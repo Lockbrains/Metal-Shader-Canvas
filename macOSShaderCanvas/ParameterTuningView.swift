@@ -22,11 +22,16 @@ struct ParameterTuningView: View {
     let canvasMode: CanvasMode
     let objects2D: [Object2D]
     let sharedFragmentCode2D: String
+    let aiSettings: AISettings
+    @Binding var projectDocument: ProjectDocument
 
     @State private var viewMode: TuningViewMode = .sliders
     @State private var compareA: UUID? = nil
     @State private var compareB: UUID? = nil
     @State private var snapshotLabel = ""
+    @State private var aiFeedback: String?
+    @State private var isRequestingFeedback = false
+    @State private var feedbackDebounceTask: Task<Void, Never>?
 
     enum TuningViewMode: String, CaseIterable {
         case sliders = "Sliders"
@@ -120,12 +125,63 @@ struct ParameterTuningView: View {
                 .frame(maxWidth: .infinity)
             } else {
                 VStack(spacing: 8) {
+                    aiFeedbackBanner
+
                     ForEach(allParams, id: \.name) { param in
                         parameterSlider(param)
                     }
                 }
                 .padding(10)
             }
+        }
+    }
+
+    @ViewBuilder
+    private var aiFeedbackBanner: some View {
+        if let feedback = aiFeedback, !feedback.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 4) {
+                    Image(systemName: "sparkle")
+                        .font(.system(size: 9))
+                        .foregroundColor(.purple)
+                    Text("AI Feedback")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(.purple.opacity(0.8))
+                    Spacer()
+                    Button(action: { aiFeedback = nil }) {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 9))
+                            .foregroundColor(.white.opacity(0.3))
+                    }
+                    .buttonStyle(.plain)
+                }
+                Text(feedback)
+                    .font(.system(size: 10))
+                    .foregroundColor(.white.opacity(0.7))
+                    .lineSpacing(2)
+            }
+            .padding(8)
+            .background(Color.purple.opacity(0.1))
+            .cornerRadius(6)
+        }
+
+        HStack {
+            Spacer()
+            Button(action: requestAIFeedback) {
+                HStack(spacing: 3) {
+                    if isRequestingFeedback {
+                        ProgressView().scaleEffect(0.5)
+                    } else {
+                        Image(systemName: "sparkle")
+                            .font(.system(size: 9))
+                    }
+                    Text("Get AI Feedback")
+                        .font(.system(size: 9))
+                }
+                .foregroundColor(.purple.opacity(0.7))
+            }
+            .buttonStyle(.plain)
+            .disabled(isRequestingFeedback || !aiSettings.isConfigured)
         }
     }
 
@@ -410,19 +466,103 @@ struct ParameterTuningView: View {
         let vals = paramValues
         let hash = activeShaders.map(\.code).joined().hashValue.description
         snapshotLabel = ""
+        let captured = aiSettings.captured
+        let isConfigured = aiSettings.isConfigured
+        let shaderCode = activeShaders.map(\.code).joined(separator: "\n\n")
+        let doc = projectDocument
+
         Task {
-            let capture = await Task.detached { MetalRenderer.current?.captureForAI() }.value
-            let snapshot = ParameterSnapshot(
+            let capture = await Task.detached { await MetalRenderer.current?.captureForAI() }.value
+            var snapshot = ParameterSnapshot(
                 paramValues: vals,
                 renderCapture: capture,
                 label: label,
                 codeHash: hash
             )
-            snapshots.append(snapshot)
+
+            if isConfigured {
+                let comment = await Self.evaluateParamsForSnapshot(
+                    params: vals, shaderCode: shaderCode, document: doc,
+                    captured: captured, renderCapture: capture
+                )
+                snapshot.aiComment = comment
+            }
+
+            await MainActor.run {
+                snapshots.append(snapshot)
+            }
         }
     }
 
     private func restoreSnapshot(_ snapshot: ParameterSnapshot) {
         paramValues = snapshot.paramValues
+    }
+
+    private func requestAIFeedback() {
+        isRequestingFeedback = true
+        let vals = paramValues
+        let shaderCode = activeShaders.map(\.code).joined(separator: "\n\n")
+        let doc = projectDocument
+        let captured = aiSettings.captured
+
+        Task {
+            let capture = await Task.detached { await MetalRenderer.current?.captureForAI() }.value
+            let feedback = await Self.evaluateParamsForSnapshot(
+                params: vals, shaderCode: shaderCode, document: doc,
+                captured: captured, renderCapture: capture
+            )
+            await MainActor.run {
+                aiFeedback = feedback
+                isRequestingFeedback = false
+            }
+        }
+    }
+
+    /// Requests a brief AI evaluation of the current parameter state.
+    private nonisolated static func evaluateParamsForSnapshot(
+        params: [String: [Float]], shaderCode: String,
+        document: ProjectDocument, captured: CapturedAISettings,
+        renderCapture: Data?
+    ) async -> String? {
+        let paramStr = params.sorted(by: { $0.key < $1.key })
+            .map { "\($0.key) = \($0.value.map { String(format: "%.3f", $0) }.joined(separator: ", "))" }
+            .joined(separator: "\n")
+
+        let prompt = """
+        Briefly evaluate these shader parameters (2-3 sentences max). \
+        Note any visual issues, suggest improvements, flag saturation points.
+
+        Project context: \(document.markdown.isEmpty ? document.visualGoal : String(document.markdown.prefix(500)))
+
+        Shader code (\(shaderCode.count) chars):
+        \(shaderCode.prefix(2000))
+
+        Current parameters:
+        \(paramStr)
+        """
+
+        let msg = ChatMessage(role: .user, content: prompt)
+        do {
+            let response: String = try await AIService.onBackground {
+                switch captured.provider {
+                case .openai:
+                    return try await AIService.shared.callOpenAI(
+                        system: "You are a shader parameter tuning assistant. Be concise and specific.",
+                        messages: [msg], captured: captured, imageData: renderCapture)
+                case .anthropic:
+                    return try await AIService.shared.callAnthropic(
+                        system: "You are a shader parameter tuning assistant. Be concise and specific.",
+                        messages: [msg], captured: captured, imageData: renderCapture)
+                case .gemini:
+                    return try await AIService.shared.callGemini(
+                        system: "You are a shader parameter tuning assistant. Be concise and specific.",
+                        messages: [msg], captured: captured, imageData: renderCapture)
+                }
+            }
+            return response.trimmingCharacters(in: .whitespacesAndNewlines)
+        } catch {
+            print("[PARAM-AI] Evaluation failed: \(error)")
+            return nil
+        }
     }
 }

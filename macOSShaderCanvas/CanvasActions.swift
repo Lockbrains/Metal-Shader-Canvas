@@ -217,7 +217,7 @@ enum CanvasActions {
         paramValues: [String: [Float]], objects2D: [Object2D],
         sharedVertexCode2D: String, sharedFragmentCode2D: String,
         labSession: LabSession? = nil, references: [ReferenceItem]? = nil,
-        projectDocument: ProjectDocument? = nil
+        projectDocument: ProjectDocument? = nil, designDoc: DesignDocument? = nil
     ) -> CanvasDocument {
         CanvasDocument(
             name: name, mode: mode, meshType: meshType, shape2DType: shape2DType,
@@ -228,7 +228,8 @@ enum CanvasActions {
             sharedFragmentCode2D: sharedFragmentCode2D,
             labSession: labSession,
             references: references,
-            projectDocument: projectDocument
+            projectDocument: projectDocument,
+            designDoc: designDoc
         )
     }
 

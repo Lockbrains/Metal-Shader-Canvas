@@ -13,7 +13,7 @@ import Foundation
 
 // MARK: - SSE Line Parser
 
-struct SSEEvent {
+nonisolated struct SSEEvent: Sendable {
     var event: String?
     var data: String = ""
 }
@@ -24,7 +24,7 @@ struct SSEEvent {
 /// (e.g. AI-generated markdown with `\n`). `URLSession.bytes.lines` splits on ALL
 /// newlines, producing continuation lines that lack any SSE prefix. These are
 /// appended to the current data buffer to reconstruct the full JSON payload.
-struct SSELineParser {
+nonisolated struct SSELineParser: Sendable {
     private var currentEvent: SSEEvent = SSEEvent()
 
     mutating func feedLine(_ line: String) -> SSEEvent? {
@@ -59,7 +59,7 @@ struct SSELineParser {
 
 // MARK: - Provider Delta Parsers
 
-func parseOpenAIDelta(_ data: String) -> String? {
+nonisolated func parseOpenAIDelta(_ data: String) -> String? {
     guard data != "[DONE]",
           let jsonData = data.data(using: .utf8),
           let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
@@ -70,7 +70,7 @@ func parseOpenAIDelta(_ data: String) -> String? {
     return content
 }
 
-func parseAnthropicDelta(_ data: String, event: String?) -> String? {
+nonisolated func parseAnthropicDelta(_ data: String, event: String?) -> String? {
     guard event == "content_block_delta",
           let jsonData = data.data(using: .utf8),
           let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
@@ -80,7 +80,7 @@ func parseAnthropicDelta(_ data: String, event: String?) -> String? {
     return text
 }
 
-func parseGeminiChunk(_ data: String) -> String? {
+nonisolated func parseGeminiChunk(_ data: String) -> String? {
     guard let jsonData = data.data(using: .utf8),
           let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
           let candidates = json["candidates"] as? [[String: Any]],
@@ -97,7 +97,7 @@ func parseGeminiChunk(_ data: String) -> String? {
 /// (and 0x0D → `\r`) restores valid JSON. JSONSerialization then decodes the escape
 /// sequences back to actual newline/CR characters in the parsed string, so the
 /// extracted text is correct.
-func parseGeminiChunkSanitized(_ data: String) -> String? {
+nonisolated func parseGeminiChunkSanitized(_ data: String) -> String? {
     let sanitized = data
         .replacingOccurrences(of: "\r", with: "\\r")
         .replacingOccurrences(of: "\n", with: "\\n")
@@ -109,7 +109,7 @@ func parseGeminiChunkSanitized(_ data: String) -> String? {
 /// Value-type snapshot of AISettings, captured on MainActor before crossing into
 /// the AIService actor. This avoids accessing @Observable properties across actor
 /// boundaries, which causes silent failures under strict concurrency.
-struct CapturedAISettings: Sendable {
+nonisolated struct CapturedAISettings: Sendable {
     let provider: AIProvider
     let apiKey: String
     let model: String
@@ -125,7 +125,7 @@ extension AISettings {
 
 // MARK: - Streaming Session
 
-private let streamingSession: URLSession = {
+nonisolated(unsafe) private let streamingSession: URLSession = {
     let config = URLSessionConfiguration.default
     config.timeoutIntervalForRequest = 300
     config.timeoutIntervalForResource = 600
@@ -253,6 +253,191 @@ extension AIService {
                         "systemInstruction": ["parts": [["text": system]]]
                     ] as [String: Any])
 
+                    let (bytes, resp) = try await streamingSession.bytes(for: req)
+                    guard let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+                        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                        continuation.yield(StreamChunk(type: .content, delta: "[Stream error: HTTP \(code)]"))
+                        continuation.finish(); return
+                    }
+                    var parser = SSELineParser()
+                    for try await line in bytes.lines {
+                        if let event = parser.feedLine(line),
+                           let text = parseGeminiChunk(event.data) {
+                            continuation.yield(StreamChunk(type: .content, delta: text))
+                        }
+                    }
+                } catch {
+                    continuation.yield(StreamChunk(type: .content, delta: "[Stream error: \(error.localizedDescription)]"))
+                }
+                continuation.finish()
+            }
+        }
+    }
+
+    // MARK: - Lab Chat Streaming
+
+    /// Streams a Lab chat response with a custom system prompt.
+    /// Returns an AsyncStream of text deltas. The accumulated text should be parsed
+    /// as LabAgentResponse JSON when the stream completes.
+    nonisolated func streamLabChat(
+        system: String, messages: [ChatMessage], captured: CapturedAISettings,
+        imageData: Data?, additionalImages: [Data] = []
+    ) -> AsyncStream<StreamChunk> {
+        switch captured.provider {
+        case .openai:
+            return streamOpenAILab(system: system, messages: messages, captured: captured, imageData: imageData, additionalImages: additionalImages)
+        case .anthropic:
+            return streamAnthropicLab(system: system, messages: messages, captured: captured, imageData: imageData, additionalImages: additionalImages)
+        case .gemini:
+            return streamGeminiLab(system: system, messages: messages, captured: captured, imageData: imageData, additionalImages: additionalImages)
+        }
+    }
+
+    private nonisolated func streamOpenAILab(
+        system: String, messages: [ChatMessage], captured: CapturedAISettings,
+        imageData: Data?, additionalImages: [Data]
+    ) -> AsyncStream<StreamChunk> {
+        let apiKey = captured.apiKey
+        let model = captured.model
+        var msgs: [[String: Any]] = [["role": "system", "content": system]]
+        for (i, m) in messages.enumerated() {
+            let role = m.role == .user ? "user" : "assistant"
+            let isLastUser = (m.role == .user && i == messages.count - 1)
+            if isLastUser {
+                var contentArray: [[String: Any]] = [["type": "text", "text": m.content]]
+                if let img = imageData {
+                    contentArray.append(["type": "image_url", "image_url": ["url": "data:image/jpeg;base64,\(img.base64EncodedString())", "detail": "low"]])
+                }
+                for extra in additionalImages {
+                    contentArray.append(["type": "image_url", "image_url": ["url": "data:image/jpeg;base64,\(extra.base64EncodedString())", "detail": "low"]])
+                }
+                msgs.append(["role": role, "content": contentArray])
+            } else {
+                msgs.append(["role": role, "content": m.content])
+            }
+        }
+        return AsyncStream { continuation in
+            Task {
+                do {
+                    var req = URLRequest(url: URL(string: "https://api.openai.com/v1/chat/completions")!)
+                    req.httpMethod = "POST"
+                    req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+                    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    req.httpBody = try JSONSerialization.data(withJSONObject: [
+                        "model": model, "messages": msgs,
+                        "max_tokens": 8192, "stream": true
+                    ] as [String: Any])
+                    let (bytes, resp) = try await streamingSession.bytes(for: req)
+                    guard let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+                        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                        continuation.yield(StreamChunk(type: .content, delta: "[Stream error: HTTP \(code)]"))
+                        continuation.finish(); return
+                    }
+                    var parser = SSELineParser()
+                    for try await line in bytes.lines {
+                        if let event = parser.feedLine(line),
+                           let text = parseOpenAIDelta(event.data) {
+                            continuation.yield(StreamChunk(type: .content, delta: text))
+                        }
+                    }
+                } catch {
+                    continuation.yield(StreamChunk(type: .content, delta: "[Stream error: \(error.localizedDescription)]"))
+                }
+                continuation.finish()
+            }
+        }
+    }
+
+    private nonisolated func streamAnthropicLab(
+        system: String, messages: [ChatMessage], captured: CapturedAISettings,
+        imageData: Data?, additionalImages: [Data]
+    ) -> AsyncStream<StreamChunk> {
+        let apiKey = captured.apiKey
+        let model = captured.model
+        var msgs: [[String: Any]] = []
+        for (i, m) in messages.enumerated() {
+            let role = m.role == .user ? "user" : "assistant"
+            let isLastUser = (m.role == .user && i == messages.count - 1)
+            if isLastUser {
+                var contentArray: [[String: Any]] = []
+                if let img = imageData {
+                    contentArray.append(["type": "image", "source": ["type": "base64", "media_type": "image/jpeg", "data": img.base64EncodedString()]])
+                }
+                for extra in additionalImages {
+                    contentArray.append(["type": "image", "source": ["type": "base64", "media_type": "image/jpeg", "data": extra.base64EncodedString()]])
+                }
+                contentArray.append(["type": "text", "text": m.content])
+                msgs.append(["role": role, "content": contentArray])
+            } else {
+                msgs.append(["role": role, "content": m.content])
+            }
+        }
+        return AsyncStream { continuation in
+            Task {
+                do {
+                    var req = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
+                    req.httpMethod = "POST"
+                    req.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+                    req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+                    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    req.httpBody = try JSONSerialization.data(withJSONObject: [
+                        "model": model, "max_tokens": 8192,
+                        "system": system, "messages": msgs, "stream": true
+                    ] as [String: Any])
+                    let (bytes, resp) = try await streamingSession.bytes(for: req)
+                    guard let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+                        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                        continuation.yield(StreamChunk(type: .content, delta: "[Stream error: HTTP \(code)]"))
+                        continuation.finish(); return
+                    }
+                    var parser = SSELineParser()
+                    for try await line in bytes.lines {
+                        if let event = parser.feedLine(line),
+                           let text = parseAnthropicDelta(event.data, event: event.event) {
+                            continuation.yield(StreamChunk(type: .content, delta: text))
+                        }
+                    }
+                } catch {
+                    continuation.yield(StreamChunk(type: .content, delta: "[Stream error: \(error.localizedDescription)]"))
+                }
+                continuation.finish()
+            }
+        }
+    }
+
+    private nonisolated func streamGeminiLab(
+        system: String, messages: [ChatMessage], captured: CapturedAISettings,
+        imageData: Data?, additionalImages: [Data]
+    ) -> AsyncStream<StreamChunk> {
+        let apiKey = captured.apiKey
+        let model = captured.model
+        var contents: [[String: Any]] = []
+        for (i, m) in messages.enumerated() {
+            let role = m.role == .user ? "user" : "model"
+            let isLastUser = (m.role == .user && i == messages.count - 1)
+            if isLastUser {
+                var parts: [[String: Any]] = [["text": m.content]]
+                if let img = imageData {
+                    parts.append(["inlineData": ["mimeType": "image/jpeg", "data": img.base64EncodedString()]])
+                }
+                for extra in additionalImages {
+                    parts.append(["inlineData": ["mimeType": "image/jpeg", "data": extra.base64EncodedString()]])
+                }
+                contents.append(["role": role, "parts": parts])
+            } else {
+                contents.append(["role": role, "parts": [["text": m.content]]])
+            }
+        }
+        return AsyncStream { continuation in
+            Task {
+                do {
+                    var req = URLRequest(url: URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):streamGenerateContent?alt=sse&key=\(apiKey)")!)
+                    req.httpMethod = "POST"
+                    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    req.httpBody = try JSONSerialization.data(withJSONObject: [
+                        "contents": contents,
+                        "systemInstruction": ["parts": [["text": system]]]
+                    ] as [String: Any])
                     let (bytes, resp) = try await streamingSession.bytes(for: req)
                     guard let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
                         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0

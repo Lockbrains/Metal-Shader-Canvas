@@ -2,266 +2,169 @@
 //  ProjectDocumentView.swift
 //  macOSShaderCanvas
 //
-//  Renders and allows editing of the co-authored Project Document in Lab mode.
-//  Each section (visual goal, technical approach, parameter design, iteration log)
-//  is independently editable by both human and AI.
+//  MarkdownDocumentView — reusable markdown editor/viewer for Lab mode documents.
+//  Used by both the Design Doc and Project Doc center-panel tabs.
+//
+//  Modes:
+//  - Read: renders markdown via MarkdownTextView (headings, code, lists, bold, inline code)
+//  - Edit: raw markdown TextEditor for direct editing
+//
+//  Toolbar: edit toggle, export .md, copy to clipboard
 //
 
 import SwiftUI
+import UniformTypeIdentifiers
 
-// MARK: - ProjectDocumentView
+// MARK: - MarkdownDocumentView
 
-struct ProjectDocumentView: View {
-    @Binding var document: ProjectDocument
-    @State private var editingSection: DocumentSection? = nil
+struct MarkdownDocumentView: View {
+    @Binding var markdown: String
+    @Binding var lastModified: Date
+    let title: String
+    let accentColor: Color
 
-    enum DocumentSection: String, CaseIterable, Identifiable {
-        case title = "Title"
-        case visualGoal = "Visual Goal"
-        case referenceAnalysis = "Reference Analysis"
-        case technicalApproach = "Technical Approach"
-        case parameterDesign = "Parameter Design"
-        case constraints = "Constraints"
-        case iterationLog = "Iteration Log"
-
-        var id: String { rawValue }
-
-        var icon: String {
-            switch self {
-            case .title:             return "textformat"
-            case .visualGoal:        return "eye"
-            case .referenceAnalysis: return "sparkle.magnifyingglass"
-            case .technicalApproach: return "wrench.and.screwdriver"
-            case .parameterDesign:   return "slider.horizontal.3"
-            case .constraints:       return "exclamationmark.triangle"
-            case .iterationLog:      return "clock.arrow.circlepath"
-            }
-        }
-    }
+    @State private var isEditing = false
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                documentHeader
-
-                sectionView(.visualGoal, text: $document.visualGoal,
-                            placeholder: "Describe the visual effect you want to achieve...")
-
-                sectionView(.referenceAnalysis, text: $document.referenceAnalysis,
-                            placeholder: "AI analysis of reference materials will appear here...")
-
-                sectionView(.technicalApproach, text: $document.technicalApproach,
-                            placeholder: "Technical approach and shader architecture...")
-
-                parameterDesignSection
-
-                constraintsSection
-
-                iterationLogSection
-            }
-            .padding(10)
+        VStack(spacing: 0) {
+            toolbar
+            Divider().background(Color.white.opacity(0.1))
+            content
         }
+        .background(Color(nsColor: NSColor(red: 0.11, green: 0.11, blue: 0.12, alpha: 1.0)))
     }
 
-    // MARK: - Header
+    // MARK: - Toolbar
 
-    private var documentHeader: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Image(systemName: "doc.text")
-                    .font(.system(size: 12))
-                    .foregroundColor(.white.opacity(0.5))
-                Text("Project Document")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(.white.opacity(0.7))
-            }
+    private var toolbar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "doc.richtext")
+                .font(.system(size: 11))
+                .foregroundColor(accentColor)
 
-            TextField("Project Title", text: $document.title)
-                .font(.system(size: 14, weight: .bold))
-                .textFieldStyle(.plain)
-                .foregroundColor(.white)
-        }
-    }
+            Text(title)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(.white.opacity(0.8))
 
-    // MARK: - Generic Section
-
-    private func sectionView(_ section: DocumentSection, text: Binding<String>, placeholder: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            sectionHeader(section)
-
-            if editingSection == section {
-                TextEditor(text: text)
-                    .font(.system(size: 11))
-                    .scrollContentBackground(.hidden)
-                    .background(Color.white.opacity(0.04))
-                    .cornerRadius(4)
-                    .frame(minHeight: 60, maxHeight: 150)
-                    .overlay(alignment: .topTrailing) {
-                        Button(action: { editingSection = nil }) {
-                            Image(systemName: "checkmark.circle.fill")
-                                .font(.system(size: 12))
-                                .foregroundColor(.green)
-                        }
-                        .buttonStyle(.plain)
-                        .padding(4)
-                    }
-            } else {
-                Group {
-                    if text.wrappedValue.isEmpty {
-                        Text(placeholder)
-                            .font(.system(size: 11))
-                            .foregroundColor(.white.opacity(0.2))
-                            .italic()
-                    } else {
-                        Text(text.wrappedValue)
-                            .font(.system(size: 11))
-                            .foregroundColor(.white.opacity(0.7))
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(6)
-                .background(Color.white.opacity(0.02))
-                .cornerRadius(4)
-                .onTapGesture { editingSection = section }
-            }
-        }
-    }
-
-    private func sectionHeader(_ section: DocumentSection) -> some View {
-        HStack(spacing: 4) {
-            Image(systemName: section.icon)
-                .font(.system(size: 9))
-                .foregroundColor(.white.opacity(0.4))
-            Text(section.rawValue)
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundColor(.white.opacity(0.5))
-            Spacer()
-            Button(action: { editingSection = (editingSection == section) ? nil : section }) {
-                Image(systemName: "pencil")
+            if !markdown.isEmpty {
+                Text("Modified \(lastModified, style: .relative) ago")
                     .font(.system(size: 9))
                     .foregroundColor(.white.opacity(0.3))
             }
+
+            Spacer()
+
+            Button(action: { isEditing.toggle() }) {
+                Image(systemName: isEditing ? "eye" : "pencil")
+                    .font(.system(size: 11))
+                    .foregroundColor(isEditing ? .cyan : .white.opacity(0.5))
+            }
             .buttonStyle(.plain)
+            .help(isEditing ? "Switch to preview" : "Edit markdown")
+
+            Button(action: copyToClipboard) {
+                Image(systemName: "doc.on.doc")
+                    .font(.system(size: 11))
+                    .foregroundColor(.white.opacity(0.5))
+            }
+            .buttonStyle(.plain)
+            .help("Copy to clipboard")
+            .disabled(markdown.isEmpty)
+
+            Button(action: exportMarkdown) {
+                Image(systemName: "square.and.arrow.up")
+                    .font(.system(size: 11))
+                    .foregroundColor(.white.opacity(0.5))
+            }
+            .buttonStyle(.plain)
+            .help("Export as .md file")
+            .disabled(markdown.isEmpty)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+
+    // MARK: - Content
+
+    @ViewBuilder
+    private var content: some View {
+        if markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isEditing {
+            emptyState
+        } else if isEditing {
+            editMode
+        } else {
+            readMode
         }
     }
 
-    // MARK: - Parameter Design Section
+    private var emptyState: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "doc.text")
+                .font(.system(size: 28))
+                .foregroundColor(.white.opacity(0.15))
+            Text("No content yet")
+                .font(.system(size: 13))
+                .foregroundColor(.white.opacity(0.3))
+            Text("The AI will write here as the conversation progresses, or you can start editing directly.")
+                .font(.system(size: 11))
+                .foregroundColor(.white.opacity(0.2))
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 260)
+            Button("Start Editing") {
+                isEditing = true
+            }
+            .buttonStyle(.plain)
+            .font(.system(size: 11, weight: .medium))
+            .foregroundColor(accentColor)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 6)
+            .background(accentColor.opacity(0.15))
+            .cornerRadius(6)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
 
-    private var parameterDesignSection: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            sectionHeader(.parameterDesign)
+    private var editMode: some View {
+        TextEditor(text: $markdown)
+            .font(.system(size: 12, design: .monospaced))
+            .scrollContentBackground(.hidden)
+            .background(Color.black.opacity(0.2))
+            .padding(8)
+            .onChange(of: markdown) {
+                lastModified = Date()
+            }
+    }
 
-            if document.parameterDesign.isEmpty {
-                Text("Parameters will be defined during the planning phase...")
-                    .font(.system(size: 11))
-                    .foregroundColor(.white.opacity(0.2))
-                    .italic()
-                    .padding(6)
-            } else {
-                ForEach(document.parameterDesign) { param in
-                    HStack(spacing: 6) {
-                        Text(param.name)
-                            .font(.system(size: 10, weight: .medium, design: .monospaced))
-                            .foregroundColor(.cyan.opacity(0.8))
-                        Text("(\(param.type.rawValue))")
-                            .font(.system(size: 9))
-                            .foregroundColor(.white.opacity(0.3))
-                        Text(param.purpose)
-                            .font(.system(size: 10))
-                            .foregroundColor(.white.opacity(0.5))
-                            .lineLimit(1)
-                        Spacer()
-                    }
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 3)
-                    .background(Color.white.opacity(0.03))
-                    .cornerRadius(3)
-                }
+    private var readMode: some View {
+        ScrollView {
+            MarkdownTextView(markdown, fontSize: 12, color: .white.opacity(0.85))
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    // MARK: - Actions
+
+    private func copyToClipboard() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(markdown, forType: .string)
+    }
+
+    private func exportMarkdown() {
+        let panel = NSSavePanel()
+        panel.title = "Export \(title)"
+        let safeName = title
+            .replacingOccurrences(of: " ", with: "_")
+            .lowercased()
+        panel.nameFieldStringValue = "\(safeName).md"
+        panel.allowedContentTypes = [.plainText]
+        panel.canCreateDirectories = true
+        if panel.runModal() == .OK, let url = panel.url {
+            do {
+                try markdown.write(to: url, atomically: true, encoding: .utf8)
+            } catch {
+                print("[MarkdownDocumentView] Export failed: \(error)")
             }
         }
-    }
-
-    // MARK: - Constraints Section
-
-    private var constraintsSection: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            sectionHeader(.constraints)
-
-            if document.constraints.isEmpty {
-                Text("No constraints defined")
-                    .font(.system(size: 11))
-                    .foregroundColor(.white.opacity(0.2))
-                    .italic()
-                    .padding(6)
-            } else {
-                ForEach(document.constraints.indices, id: \.self) { idx in
-                    HStack(spacing: 4) {
-                        Image(systemName: "exclamationmark.triangle")
-                            .font(.system(size: 8))
-                            .foregroundColor(.orange.opacity(0.6))
-                        Text(document.constraints[idx])
-                            .font(.system(size: 10))
-                            .foregroundColor(.white.opacity(0.6))
-                    }
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                }
-            }
-        }
-    }
-
-    // MARK: - Iteration Log Section
-
-    private var iterationLogSection: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            sectionHeader(.iterationLog)
-
-            if document.iterationLog.isEmpty {
-                Text("Iterations will be logged as you collaborate...")
-                    .font(.system(size: 11))
-                    .foregroundColor(.white.opacity(0.2))
-                    .italic()
-                    .padding(6)
-            } else {
-                ForEach(document.iterationLog) { entry in
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack {
-                            Text(entry.date, style: .relative)
-                                .font(.system(size: 9))
-                                .foregroundColor(.white.opacity(0.3))
-                            Spacer()
-                            outcomeTag(entry.outcome)
-                        }
-                        Text(entry.description)
-                            .font(.system(size: 10))
-                            .foregroundColor(.white.opacity(0.6))
-                        if !entry.decision.isEmpty {
-                            Text("Decision: \(entry.decision)")
-                                .font(.system(size: 10, weight: .medium))
-                                .foregroundColor(.white.opacity(0.5))
-                        }
-                    }
-                    .padding(6)
-                    .background(Color.white.opacity(0.03))
-                    .cornerRadius(4)
-                }
-            }
-        }
-    }
-
-    private func outcomeTag(_ outcome: String) -> some View {
-        let color: Color = switch outcome {
-        case "accepted": .green
-        case "rejected": .red
-        case "partial": .orange
-        default: .gray
-        }
-        return Text(outcome.capitalized)
-            .font(.system(size: 8, weight: .bold))
-            .foregroundColor(color)
-            .padding(.horizontal, 5)
-            .padding(.vertical, 1)
-            .background(color.opacity(0.15))
-            .cornerRadius(3)
     }
 }

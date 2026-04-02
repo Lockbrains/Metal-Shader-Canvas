@@ -98,13 +98,19 @@ struct LabView: View {
 
     @State private var leftPanelTab: LeftPanelTab = .references
     @State private var rightPanelTab: RightPanelTab = .chat
+    @State private var centerPanelTab: CenterPanelTab = .shader
     @State private var isLeftPanelVisible = true
     @State private var isRightPanelVisible = true
     @State private var isShaderEditorVisible = false
+    @State private var isCenterSplit = false
+    @State private var showingPhaseMenu = false
+
+    // MARK: - Documents
+
+    @State private var designDoc: DesignDocument = DesignDocument()
 
     enum LeftPanelTab: String, CaseIterable {
         case references = "References"
-        case document = "Document"
         case layers = "Layers"
     }
 
@@ -112,6 +118,12 @@ struct LabView: View {
         case chat = "Discussion"
         case parameters = "Parameters"
         case adversarial = "Adversarial"
+    }
+
+    enum CenterPanelTab: String, CaseIterable {
+        case shader = "Shader"
+        case designDoc = "Design Doc"
+        case projectDoc = "Project Doc"
     }
 
     private let sidePanelWidth: CGFloat = 300
@@ -151,8 +163,6 @@ struct LabView: View {
 
             VStack(spacing: 0) {
                 labTopBar
-                Divider().background(Color.white.opacity(0.1))
-                phaseIndicator
                 Divider().background(Color.white.opacity(0.1))
 
                 HStack(spacing: 0) {
@@ -229,6 +239,8 @@ struct LabView: View {
                 .background((canvasMode.is2D ? Color.green : Color.orange).opacity(0.15))
                 .cornerRadius(4)
 
+            phaseMenuButton
+
             Spacer()
 
             HStack(spacing: 8) {
@@ -255,52 +267,57 @@ struct LabView: View {
         .padding(.vertical, 10)
     }
 
-    // MARK: - Phase Indicator
+    // MARK: - Phase Menu (collapsed from strip to popover)
 
-    private var phaseIndicator: some View {
-        HStack(spacing: 0) {
-            ForEach(LabPhase.allCases) { phase in
-                Button(action: {
-                    withAnimation(.easeInOut(duration: 0.2)) {
+    private var phaseMenuButton: some View {
+        Button(action: { showingPhaseMenu.toggle() }) {
+            HStack(spacing: 4) {
+                Image(systemName: "list.bullet")
+                    .font(.system(size: 10))
+                Text(labSession.currentPhase.displayName)
+                    .font(.system(size: 10, weight: .medium))
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 7))
+            }
+            .foregroundColor(.white.opacity(0.6))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(Color.white.opacity(0.08))
+            .cornerRadius(6)
+        }
+        .buttonStyle(.plain)
+        .popover(isPresented: $showingPhaseMenu, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 2) {
+                ForEach(LabPhase.allCases) { phase in
+                    Button(action: {
                         labSession.advanceTo(phase)
+                        showingPhaseMenu = false
+                    }) {
+                        HStack(spacing: 8) {
+                            Image(systemName: phase.icon)
+                                .font(.system(size: 11))
+                                .frame(width: 16)
+                            Text(phase.displayName)
+                                .font(.system(size: 12))
+                            Spacer()
+                            if labSession.hasVisited(phase) {
+                                Image(systemName: "checkmark")
+                                    .font(.system(size: 9, weight: .semibold))
+                                    .foregroundColor(.green)
+                            }
+                        }
+                        .foregroundColor(labSession.currentPhase == phase ? .white : .white.opacity(0.7))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(labSession.currentPhase == phase ? Color.white.opacity(0.12) : Color.clear)
+                        .cornerRadius(5)
                     }
-                }) {
-                    HStack(spacing: 5) {
-                        Image(systemName: phase.icon)
-                            .font(.system(size: 10))
-                        Text(phase.displayName)
-                            .font(.system(size: 10, weight: .medium))
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(
-                        labSession.currentPhase == phase
-                            ? Color.white.opacity(0.12)
-                            : Color.clear
-                    )
-                    .foregroundColor(
-                        labSession.currentPhase == phase
-                            ? .white
-                            : labSession.hasVisited(phase)
-                                ? .white.opacity(0.5)
-                                : .white.opacity(0.25)
-                    )
-                    .cornerRadius(6)
-                }
-                .buttonStyle(.plain)
-
-                if phase != LabPhase.allCases.last {
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 8))
-                        .foregroundColor(.white.opacity(0.15))
-                        .padding(.horizontal, 2)
+                    .buttonStyle(.plain)
                 }
             }
-            Spacer()
+            .padding(8)
+            .frame(width: 220)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 6)
-        .background(Color.white.opacity(0.03))
     }
 
     // MARK: - Left Panel
@@ -320,8 +337,6 @@ struct LabView: View {
             switch leftPanelTab {
             case .references:
                 ReferenceBoard(references: $references)
-            case .document:
-                ProjectDocumentView(document: $projectDocument)
             case .layers:
                 layerListPanel
             }
@@ -332,6 +347,109 @@ struct LabView: View {
     // MARK: - Center Panel
 
     private var centerPanel: some View {
+        VStack(spacing: 0) {
+            centerTabBar
+            Divider().background(Color.white.opacity(0.1))
+
+            if isCenterSplit {
+                splitCenterContent
+            } else {
+                singleCenterContent
+            }
+        }
+    }
+
+    private var centerTabBar: some View {
+        HStack(spacing: 2) {
+            ForEach(CenterPanelTab.allCases, id: \.self) { tab in
+                Button(action: { withAnimation(.easeInOut(duration: 0.15)) { centerPanelTab = tab } }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: centerTabIcon(tab))
+                            .font(.system(size: 9))
+                        Text(tab.rawValue)
+                            .font(.system(size: 10, weight: .medium))
+                    }
+                    .foregroundColor(centerPanelTab == tab ? .white : .white.opacity(0.4))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(centerPanelTab == tab ? Color.white.opacity(0.1) : Color.clear)
+                    .cornerRadius(5)
+                }
+                .buttonStyle(.plain)
+            }
+
+            Spacer()
+
+            Button(action: { withAnimation(.easeInOut(duration: 0.2)) { isCenterSplit.toggle() } }) {
+                Image(systemName: isCenterSplit ? "rectangle" : "rectangle.split.2x1")
+                    .font(.system(size: 11))
+                    .foregroundColor(isCenterSplit ? .cyan : .white.opacity(0.4))
+            }
+            .buttonStyle(.plain)
+            .help(isCenterSplit ? "Exit split view" : "Split: Shader + Document")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+    }
+
+    private func centerTabIcon(_ tab: CenterPanelTab) -> String {
+        switch tab {
+        case .shader:     return "cube.transparent"
+        case .designDoc:  return "doc.text"
+        case .projectDoc: return "doc.richtext"
+        }
+    }
+
+    @ViewBuilder
+    private var singleCenterContent: some View {
+        switch centerPanelTab {
+        case .shader:
+            shaderPreviewPanel
+        case .designDoc:
+            MarkdownDocumentView(
+                markdown: $designDoc.markdown,
+                lastModified: $designDoc.lastModified,
+                title: "Design Document",
+                accentColor: .cyan
+            )
+        case .projectDoc:
+            MarkdownDocumentView(
+                markdown: $projectDocument.markdown,
+                lastModified: $projectDocument.lastModified,
+                title: "Project Document",
+                accentColor: .mint
+            )
+        }
+    }
+
+    private var splitCenterContent: some View {
+        HSplitView {
+            shaderPreviewPanel
+                .frame(minWidth: 200)
+
+            Group {
+                switch centerPanelTab {
+                case .shader, .designDoc:
+                    MarkdownDocumentView(
+                        markdown: $designDoc.markdown,
+                        lastModified: $designDoc.lastModified,
+                        title: "Design Document",
+                        accentColor: .cyan
+                    )
+                case .projectDoc:
+                    MarkdownDocumentView(
+                        markdown: $projectDocument.markdown,
+                        lastModified: $projectDocument.lastModified,
+                        title: "Project Document",
+                        accentColor: .mint
+                    )
+                }
+            }
+            .frame(minWidth: 200)
+        }
+    }
+
+    private var shaderPreviewPanel: some View {
         VStack(spacing: 0) {
             MetalView(
                 activeShaders: activeShaders,
@@ -381,6 +499,8 @@ struct LabView: View {
                     labSession: $labSession,
                     references: references,
                     projectDocument: $projectDocument,
+                    designDoc: $designDoc,
+                    paramValues: $paramValues,
                     activeShaders: activeShaders,
                     aiSettings: aiSettings,
                     canvasMode: canvasMode,
@@ -390,7 +510,6 @@ struct LabView: View {
                     sharedVertexCode2D: sharedVertexCode2D,
                     sharedFragmentCode2D: sharedFragmentCode2D,
                     compilationError: compilationError,
-                    paramValues: paramValues,
                     meshType: meshType,
                     onAgentActions: { actions in executeAgentActions(actions) }
                 )
@@ -401,7 +520,9 @@ struct LabView: View {
                     activeShaders: activeShaders,
                     canvasMode: canvasMode,
                     objects2D: objects2D,
-                    sharedFragmentCode2D: sharedFragmentCode2D
+                    sharedFragmentCode2D: sharedFragmentCode2D,
+                    aiSettings: aiSettings,
+                    projectDocument: $projectDocument
                 )
             case .adversarial:
                 AdversarialView(
@@ -660,7 +781,8 @@ struct LabView: View {
             sharedFragmentCode2D: sharedFragmentCode2D,
             labSession: session,
             references: references.isEmpty ? nil : references,
-            projectDocument: projectDocument.isEmpty ? nil : projectDocument
+            projectDocument: projectDocument.isEmpty ? nil : projectDocument,
+            designDoc: designDoc.isEmpty ? nil : designDoc
         )
         do {
             try CanvasActions.saveDocument(doc, to: url)
@@ -670,7 +792,7 @@ struct LabView: View {
             let savedMode = canvasMode
             let savedURL = url
             Task {
-                let capture = await Task.detached { MetalRenderer.current?.captureForAI() }.value
+                let capture = await Task.detached { await MetalRenderer.current?.captureForAI() }.value
                 if let data = capture {
                     recentManager.addRecent(name: savedName, fileURL: savedURL, mode: savedMode, snapshot: NSImage(data: data))
                 } else {
@@ -704,7 +826,11 @@ struct LabView: View {
                 adversarialProposals = session.adversarialProposals
             }
             if let refs = doc.references { references = refs }
-            if let projDoc = doc.projectDocument { projectDocument = projDoc }
+            if let projDoc = doc.projectDocument {
+                projectDocument = projDoc
+                projectDocument.migrateToMarkdown()
+            }
+            if let dd = doc.designDoc { designDoc = dd }
 
             recentManager.addRecent(name: doc.name, fileURL: url, mode: doc.mode)
             Task { @MainActor in hasUnsavedChanges = false }

@@ -39,7 +39,7 @@ import Foundation
 ///
 /// Each step targets a specific shader concept and provides both
 /// starter code (with TODOs) and a complete solution.
-struct TutorialStep: Identifiable {
+nonisolated struct TutorialStep: Identifiable, Sendable {
     let id: Int
     let title: String
     let subtitle: String

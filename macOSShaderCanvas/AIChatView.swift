@@ -445,7 +445,7 @@ struct AIChatView: View {
 
     /// Builds a URLRequest for the SSE streaming endpoint based on the provider.
     /// Static so it can be called from Task.detached without capturing self.
-    private static func buildSSERequest(
+    private nonisolated static func buildSSERequest(
         systemPrompt: String,
         userContent: String,
         captured: CapturedAISettings,
@@ -655,7 +655,7 @@ struct AIChatView: View {
         print("[CANVAS-SEND] context built, handleSubmit END (Task scheduled)  +\(Int((CFAbsoluteTimeGetCurrent()-t0)*1000))ms")
         Task {
             print("[CANVAS-SEND] Task body START  +\(Int((CFAbsoluteTimeGetCurrent()-t0)*1000))ms")
-            let snapshot = await Task.detached { MetalRenderer.current?.captureForAI() }.value
+            let snapshot = await Task.detached { await MetalRenderer.current?.captureForAI() }.value
             chatStore.messages[userMsgIdx].renderSnapshot = snapshot
             let combinedImage = userImg ?? snapshot
             do {
@@ -678,7 +678,7 @@ struct AIChatView: View {
                         try await AIService.shared.generatePlan(
                             request: text, context: context,
                             dataFlowDescription: dataFlowDesc,
-                            canvasMode: canvasMode, settings: aiSettings,
+                            canvasMode: canvasMode, captured: captured,
                             imageData: combinedImage
                         )
                     }
@@ -784,18 +784,19 @@ struct AIChatView: View {
 
         // Phase 1: Generate shader code (with streaming)
         do {
-            let snapshot = await Task.detached { MetalRenderer.current?.captureForAI() }.value
+            let snapshot = await Task.detached { await MetalRenderer.current?.captureForAI() }.value
             let freshContext = await MainActor.run { buildContext() }
             let captured = await MainActor.run { aiSettings.captured }
+            let currentNode = plan.nodes[i]
 
             let stepSystemPrompt = await AIService.onBackground {
                 await AIService.shared.buildStepSystemPrompt(
-                    node: plan.nodes[i], context: freshContext,
+                    node: currentNode, context: freshContext,
                     dataFlowDescription: dataFlowDesc,
                     canvasMode: canvasMode, handoffSummary: handoffSummary
                 )
             }
-            let stepUserContent = "Execute plan step: \(plan.nodes[i].title)\n\(plan.nodes[i].description)"
+            let stepUserContent = "Execute plan step: \(currentNode.title)\n\(currentNode.description)"
 
             let accumulated = await streamDirectSSE(
                 systemPrompt: stepSystemPrompt,
@@ -809,9 +810,9 @@ struct AIChatView: View {
                 streamingThinking = "⏳ Retrying step with non-streaming API..."
                 response = try await AIService.onBackground {
                     try await AIService.shared.executePlanStep(
-                        node: plan.nodes[i], context: freshContext,
+                        node: currentNode, context: freshContext,
                         dataFlowDescription: dataFlowDesc, canvasMode: canvasMode,
-                        settings: aiSettings, handoffSummary: handoffSummary,
+                        captured: captured, handoffSummary: handoffSummary,
                         imageData: snapshot
                     )
                 }
@@ -900,9 +901,9 @@ struct AIChatView: View {
 
             let verifySnapshot: Data? = await Task.detached {
                 if let pid = previewObjectID {
-                    return MetalRenderer.current?.capturePreviewObject(pid)
+                    return await MetalRenderer.current?.capturePreviewObject(pid)
                 }
-                return MetalRenderer.current?.captureForAI()
+                return await MetalRenderer.current?.captureForAI()
             }.value
             var verificationNote = ""
 
@@ -916,7 +917,7 @@ struct AIChatView: View {
                         try await AIService.shared.verifyStepResult(
                             stepTitle: stepTitle, stepDescription: stepDesc + verifyHint,
                             screenshot: verifyData, context: verifyContext,
-                            canvasMode: canvasMode, settings: aiSettings
+                            canvasMode: canvasMode, captured: captured
                         )
                     }
                     if !result.passed {
@@ -926,11 +927,12 @@ struct AIChatView: View {
                             "\n\n--- VISUAL VERIFICATION FAILED ---\n\(result.feedback)\nPlease adjust the shader to fix the visual issue.\n"
 
                         do {
+                            let fixNode = plan.nodes[i]
                             let fixResponse = try await AIService.onBackground {
                                 try await AIService.shared.executePlanStep(
-                                    node: plan.nodes[i], context: fixContext,
+                                    node: fixNode, context: fixContext,
                                     dataFlowDescription: dataFlowDesc, canvasMode: canvasMode,
-                                    settings: aiSettings, handoffSummary: fixHandoff,
+                                    captured: captured, handoffSummary: fixHandoff,
                                     imageData: verifyData
                                 )
                             }
@@ -1011,7 +1013,7 @@ struct AIChatView: View {
                 try await AIService.shared.agentChat(
                     messages: [ChatMessage(role: .user, content: "Analyze this failure")],
                     context: prompt, dataFlowDescription: "",
-                    canvasMode: canvasMode, settings: aiSettings
+                    canvasMode: canvasMode, captured: captured
                 )
             }
             return analysis.explanation
@@ -1060,7 +1062,8 @@ struct AIChatView: View {
             }
 
             let fixContext = await MainActor.run { buildContext() }
-            let snapshot = await Task.detached { MetalRenderer.current?.captureForAI() }.value
+            let captured = await MainActor.run { aiSettings.captured }
+            let snapshot = await Task.detached { await MetalRenderer.current?.captureForAI() }.value
 
             // Include error history so the AI doesn't repeat failed approaches
             let errorHistory = previousErrors.count > 1
@@ -1082,7 +1085,7 @@ struct AIChatView: View {
                     try await AIService.shared.agentChat(
                         messages: [fixMsg], context: fixContext,
                         dataFlowDescription: dataFlowDesc,
-                        canvasMode: canvasMode, settings: aiSettings,
+                        canvasMode: canvasMode, captured: captured,
                         imageData: snapshot
                     )
                 }
@@ -1119,10 +1122,11 @@ struct AIChatView: View {
         guard aiSettings.isConfigured, !tutorialTopic.isEmpty else { return }
         isTutorialLoading = true; showTutorialPrompt = false; errorMessage = nil
         let topic = tutorialTopic
+        let captured = aiSettings.captured
         Task {
             do {
                 let steps = try await AIService.onBackground {
-                    try await AIService.shared.generateTutorial(topic: topic, settings: aiSettings)
+                    try await AIService.shared.generateTutorial(topic: topic, captured: captured)
                 }
                 await MainActor.run { isTutorialLoading = false; chatStore.messages.append(ChatMessage(role: .assistant, content: "Tutorial \"\(topic)\" generated (\(steps.count) steps). Loading...")); onGenerateTutorial(steps) }
             } catch {
@@ -1142,14 +1146,15 @@ struct AIChatView: View {
         isLoading = true; errorMessage = nil
         let context = buildContext()
         let dataFlowDesc = buildDataFlowDescription()
+        let captured = aiSettings.captured
         Task {
-            let snapshot = await Task.detached { MetalRenderer.current?.captureForAI() }.value
+            let snapshot = await Task.detached { await MetalRenderer.current?.captureForAI() }.value
             do {
                 let response = try await AIService.onBackground {
                     try await AIService.shared.agentChat(
                         messages: chatStore.messages, context: context,
                         dataFlowDescription: dataFlowDesc,
-                        canvasMode: canvasMode, settings: aiSettings,
+                        canvasMode: canvasMode, captured: captured,
                         imageData: snapshot
                     )
                 }

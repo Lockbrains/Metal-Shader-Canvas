@@ -45,13 +45,13 @@ actor AIService {
     nonisolated static func onBackground<T: Sendable>(
         _ work: @Sendable @escaping () async throws -> T
     ) async throws -> T {
-        try await Task.detached(operation: work).value
+        try await Task.detached { try await work() }.value
     }
 
     nonisolated static func onBackground<T: Sendable>(
         _ work: @Sendable @escaping () async -> T
     ) async -> T {
-        await Task.detached(operation: work).value
+        await Task.detached { await work() }.value
     }
 
     private let session: URLSession = {
@@ -74,23 +74,23 @@ actor AIService {
     /// - Technical barriers if the request cannot be fulfilled
     ///
     /// Falls back to plain text if the model's response cannot be parsed as JSON.
-    func agentChat(messages: [ChatMessage], context: String, dataFlowDescription: String, canvasMode: CanvasMode = .threeDimensional, settings: AISettings, imageData: Data? = nil, additionalImages: [Data] = []) async throws -> AgentResponse {
-        print("[ACTOR] agentChat ENTERED  isMainThread=\(Thread.isMainThread)  msgs=\(messages.count)  imgs=\(additionalImages.count)  imgData=\(imageData?.count ?? 0)")
+    func agentChat(messages: [ChatMessage], context: String, dataFlowDescription: String, canvasMode: CanvasMode = .threeDimensional, captured: CapturedAISettings, imageData: Data? = nil, additionalImages: [Data] = []) async throws -> AgentResponse {
+        print("[ACTOR] agentChat ENTERED  msgs=\(messages.count)  imgs=\(additionalImages.count)  imgData=\(imageData?.count ?? 0)")
         let systemPrompt = canvasMode.is2D
             ? build2DSystemPrompt(context: context, dataFlowDescription: dataFlowDescription)
             : build3DSystemPrompt(context: context, dataFlowDescription: dataFlowDescription)
         print("[ACTOR] systemPrompt built  len=\(systemPrompt.count)")
         let rawResponse: String
-        switch settings.selectedProvider {
+        switch captured.provider {
         case .openai:
             print("[ACTOR] BEFORE callOpenAI")
-            rawResponse = try await callOpenAI(system: systemPrompt, messages: messages, settings: settings, imageData: imageData, additionalImages: additionalImages)
+            rawResponse = try await callOpenAI(system: systemPrompt, messages: messages, captured: captured, imageData: imageData, additionalImages: additionalImages)
         case .anthropic:
             print("[ACTOR] BEFORE callAnthropic")
-            rawResponse = try await callAnthropic(system: systemPrompt, messages: messages, settings: settings, imageData: imageData, additionalImages: additionalImages)
+            rawResponse = try await callAnthropic(system: systemPrompt, messages: messages, captured: captured, imageData: imageData, additionalImages: additionalImages)
         case .gemini:
             print("[ACTOR] BEFORE callGemini")
-            rawResponse = try await callGemini(system: systemPrompt, messages: messages, settings: settings, imageData: imageData, additionalImages: additionalImages)
+            rawResponse = try await callGemini(system: systemPrompt, messages: messages, captured: captured, imageData: imageData, additionalImages: additionalImages)
         }
         do {
             return try parseAgentResponse(from: rawResponse)
@@ -106,13 +106,13 @@ actor AIService {
     /// Phase 1 of Plan Mode: the AI analyzes the request and produces a task tree
     /// (as JSON) that can be reviewed before execution. Each node specifies what
     /// context it needs and what it will produce.
-    func generatePlan(request: String, context: String, dataFlowDescription: String, canvasMode: CanvasMode, settings: AISettings, imageData: Data? = nil) async throws -> AgentPlan {
+    func generatePlan(request: String, context: String, dataFlowDescription: String, canvasMode: CanvasMode, captured: CapturedAISettings, imageData: Data? = nil) async throws -> AgentPlan {
         let (prompt, userMsg) = buildPlanPrompt(request: request, context: context, dataFlowDescription: dataFlowDescription)
         let rawResponse: String
-        switch settings.selectedProvider {
-        case .openai:   rawResponse = try await callOpenAI(system: prompt, messages: [userMsg], settings: settings, imageData: imageData)
-        case .anthropic: rawResponse = try await callAnthropic(system: prompt, messages: [userMsg], settings: settings, imageData: imageData)
-        case .gemini:   rawResponse = try await callGemini(system: prompt, messages: [userMsg], settings: settings, imageData: imageData)
+        switch captured.provider {
+        case .openai:   rawResponse = try await callOpenAI(system: prompt, messages: [userMsg], captured: captured, imageData: imageData)
+        case .anthropic: rawResponse = try await callAnthropic(system: prompt, messages: [userMsg], captured: captured, imageData: imageData)
+        case .gemini:   rawResponse = try await callGemini(system: prompt, messages: [userMsg], captured: captured, imageData: imageData)
         }
         return try parsePlanResponse(from: rawResponse)
     }
@@ -207,17 +207,17 @@ actor AIService {
     }
 
     /// Executes a single plan node, producing an AgentResponse with actions.
-    func executePlanStep(node: PlanNode, context: String, dataFlowDescription: String, canvasMode: CanvasMode, settings: AISettings, handoffSummary: String? = nil, imageData: Data? = nil) async throws -> AgentResponse {
+    func executePlanStep(node: PlanNode, context: String, dataFlowDescription: String, canvasMode: CanvasMode, captured: CapturedAISettings, handoffSummary: String? = nil, imageData: Data? = nil) async throws -> AgentResponse {
         let (prompt, userMsg) = buildPlanStepPrompt(
             node: node, context: context,
             dataFlowDescription: dataFlowDescription,
             canvasMode: canvasMode, handoffSummary: handoffSummary
         )
         let rawResponse: String
-        switch settings.selectedProvider {
-        case .openai:   rawResponse = try await callOpenAI(system: prompt, messages: [userMsg], settings: settings, imageData: imageData)
-        case .anthropic: rawResponse = try await callAnthropic(system: prompt, messages: [userMsg], settings: settings, imageData: imageData)
-        case .gemini:   rawResponse = try await callGemini(system: prompt, messages: [userMsg], settings: settings, imageData: imageData)
+        switch captured.provider {
+        case .openai:   rawResponse = try await callOpenAI(system: prompt, messages: [userMsg], captured: captured, imageData: imageData)
+        case .anthropic: rawResponse = try await callAnthropic(system: prompt, messages: [userMsg], captured: captured, imageData: imageData)
+        case .gemini:   rawResponse = try await callGemini(system: prompt, messages: [userMsg], captured: captured, imageData: imageData)
         }
         do {
             return try parseAgentResponse(from: rawResponse)
@@ -272,7 +272,7 @@ actor AIService {
     func verifyStepResult(
         stepTitle: String, stepDescription: String,
         screenshot: Data, context: String,
-        canvasMode: CanvasMode, settings: AISettings
+        canvasMode: CanvasMode, captured: CapturedAISettings
     ) async throws -> (passed: Bool, feedback: String) {
         let verifyPrompt = """
         You are reviewing the visual output of a shader step: "\(stepTitle)"
@@ -293,10 +293,10 @@ actor AIService {
         """
         let msg = ChatMessage(role: .user, content: "Verify step: \(stepTitle)")
         let rawResponse: String
-        switch settings.selectedProvider {
-        case .openai:   rawResponse = try await callOpenAI(system: verifyPrompt, messages: [msg], settings: settings, imageData: screenshot)
-        case .anthropic: rawResponse = try await callAnthropic(system: verifyPrompt, messages: [msg], settings: settings, imageData: screenshot)
-        case .gemini:   rawResponse = try await callGemini(system: verifyPrompt, messages: [msg], settings: settings, imageData: screenshot)
+        switch captured.provider {
+        case .openai:   rawResponse = try await callOpenAI(system: verifyPrompt, messages: [msg], captured: captured, imageData: screenshot)
+        case .anthropic: rawResponse = try await callAnthropic(system: verifyPrompt, messages: [msg], captured: captured, imageData: screenshot)
+        case .gemini:   rawResponse = try await callGemini(system: verifyPrompt, messages: [msg], captured: captured, imageData: screenshot)
         }
         // Parse the JSON response
         let cleaned = rawResponse.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -369,7 +369,7 @@ actor AIService {
     ///   - settings: The current AI provider configuration.
     /// - Returns: An array of `TutorialStep` objects ready for the tutorial panel.
     /// - Throws: `AIError` if the API call fails or the response cannot be parsed.
-    func generateTutorial(topic: String, settings: AISettings) async throws -> [TutorialStep] {
+    func generateTutorial(topic: String, captured: CapturedAISettings) async throws -> [TutorialStep] {
         let systemPrompt = """
         You are a Metal Shading Language expert educator. Generate a step-by-step shader tutorial.
         Output ONLY a valid JSON array (no markdown). Each element:
@@ -381,10 +381,10 @@ actor AIService {
         """
         let userMsg = ChatMessage(role: .user, content: "Create a tutorial about: \(topic)")
         let response: String
-        switch settings.selectedProvider {
-        case .openai:   response = try await callOpenAI(system: systemPrompt, messages: [userMsg], settings: settings)
-        case .anthropic: response = try await callAnthropic(system: systemPrompt, messages: [userMsg], settings: settings)
-        case .gemini:   response = try await callGemini(system: systemPrompt, messages: [userMsg], settings: settings)
+        switch captured.provider {
+        case .openai:   response = try await callOpenAI(system: systemPrompt, messages: [userMsg], captured: captured)
+        case .anthropic: response = try await callAnthropic(system: systemPrompt, messages: [userMsg], captured: captured)
+        case .gemini:   response = try await callGemini(system: systemPrompt, messages: [userMsg], captured: captured)
         }
         return try parseTutorialSteps(from: response)
     }
@@ -733,11 +733,11 @@ actor AIService {
     // MARK: - Provider Implementations
 
     /// Calls the OpenAI Chat Completions API with optional vision support.
-    func callOpenAI(system: String, messages: [ChatMessage], settings: AISettings, imageData: Data? = nil, additionalImages: [Data] = []) async throws -> String {
-        print("[API] callOpenAI START  isMainThread=\(Thread.isMainThread)  msgCount=\(messages.count)")
+    func callOpenAI(system: String, messages: [ChatMessage], captured: CapturedAISettings, imageData: Data? = nil, additionalImages: [Data] = []) async throws -> String {
+        print("[API] callOpenAI START  msgCount=\(messages.count)")
         var req = URLRequest(url: URL(string: "https://api.openai.com/v1/chat/completions")!)
         req.httpMethod = "POST"
-        req.setValue("Bearer \(settings.openAIKey)", forHTTPHeaderField: "Authorization")
+        req.setValue("Bearer \(captured.apiKey)", forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         var msgs: [[String: Any]] = [["role": "system", "content": system]]
         for (i, m) in messages.enumerated() {
@@ -759,7 +759,7 @@ actor AIService {
             }
         }
         print("[API] callOpenAI request body serializing...")
-        req.httpBody = try JSONSerialization.data(withJSONObject: ["model": settings.openAIModel, "messages": msgs, "max_tokens": 4096] as [String: Any])
+        req.httpBody = try JSONSerialization.data(withJSONObject: ["model": captured.model, "messages": msgs, "max_tokens": 4096] as [String: Any])
         print("[API] callOpenAI BEFORE await session.data  bodySize=\(req.httpBody?.count ?? 0)")
         let (data, resp) = try await session.data(for: req)
         print("[API] callOpenAI AFTER await session.data")
@@ -770,10 +770,10 @@ actor AIService {
     }
 
     /// Calls the Anthropic Messages API with optional vision support.
-    func callAnthropic(system: String, messages: [ChatMessage], settings: AISettings, imageData: Data? = nil, additionalImages: [Data] = []) async throws -> String {
+    func callAnthropic(system: String, messages: [ChatMessage], captured: CapturedAISettings, imageData: Data? = nil, additionalImages: [Data] = []) async throws -> String {
         var req = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
         req.httpMethod = "POST"
-        req.setValue(settings.anthropicKey, forHTTPHeaderField: "x-api-key")
+        req.setValue(captured.apiKey, forHTTPHeaderField: "x-api-key")
         req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         var msgs: [[String: Any]] = []
@@ -795,7 +795,7 @@ actor AIService {
                 msgs.append(["role": role, "content": m.content])
             }
         }
-        req.httpBody = try JSONSerialization.data(withJSONObject: ["model": settings.anthropicModel, "max_tokens": 4096, "system": system, "messages": msgs] as [String: Any])
+        req.httpBody = try JSONSerialization.data(withJSONObject: ["model": captured.model, "max_tokens": 4096, "system": system, "messages": msgs] as [String: Any])
         let (data, resp) = try await session.data(for: req)
         try check(resp, data: data, provider: "Anthropic")
         let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
@@ -804,9 +804,9 @@ actor AIService {
     }
 
     /// Calls the Google Gemini generateContent API with optional vision support.
-    func callGemini(system: String, messages: [ChatMessage], settings: AISettings, imageData: Data? = nil, additionalImages: [Data] = []) async throws -> String {
-        let model = settings.geminiModel
-        var req = URLRequest(url: URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent?key=\(settings.geminiKey)")!)
+    func callGemini(system: String, messages: [ChatMessage], captured: CapturedAISettings, imageData: Data? = nil, additionalImages: [Data] = []) async throws -> String {
+        let model = captured.model
+        var req = URLRequest(url: URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent?key=\(captured.apiKey)")!)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         var contents: [[String: Any]] = []
@@ -918,7 +918,7 @@ actor AIService {
 // MARK: - AI Error Types
 
 /// Errors that can occur during AI API interactions.
-enum AIError: LocalizedError {
+nonisolated enum AIError: LocalizedError, Sendable {
     /// No API key has been configured for the selected provider.
     case notConfigured
 

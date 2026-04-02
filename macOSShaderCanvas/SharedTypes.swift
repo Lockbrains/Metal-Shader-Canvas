@@ -34,7 +34,7 @@ extension UTType {
 /// Distinguishes between workspace modes.
 /// Canvas modes provide direct shader editing. Lab modes add AI-collaborative
 /// workflow with reference analysis, project documents, and engineering haptics.
-enum CanvasMode: String, Codable, CaseIterable, Identifiable {
+nonisolated enum CanvasMode: String, Codable, CaseIterable, Identifiable, Sendable {
     case twoDimensional = "2D"
     case threeDimensional = "3D"
     case twoDimensionalLab = "2D Lab"
@@ -182,7 +182,7 @@ struct Transform2D {
 /// 3. **Fullscreen** — post-processing effects applied to the entire rendered image
 ///
 /// Each category maps to a different stage in the Metal rendering pipeline.
-enum ShaderCategory: String, CaseIterable, Identifiable, Codable {
+nonisolated enum ShaderCategory: String, CaseIterable, Identifiable, Codable, Sendable {
     case vertex = "Vertex"
     case fragment = "Fragment"
     case fullscreen = "Fullscreen"
@@ -414,8 +414,9 @@ struct CanvasDocument: Codable {
     var labSession: LabSession?
     var references: [ReferenceItem]?
     var projectDocument: ProjectDocument?
+    var designDoc: DesignDocument?
     
-    init(name: String, mode: CanvasMode = .threeDimensional, meshType: MeshType, shape2DType: Shape2DType = .roundedRectangle, shaders: [ActiveShader], dataFlow: DataFlowConfig = DataFlowConfig(), dataFlow2D: DataFlow2DConfig = DataFlow2DConfig(), paramValues: [String: [Float]] = [:], objects2D: [Object2D]? = nil, sharedVertexCode2D: String? = nil, sharedFragmentCode2D: String? = nil, labSession: LabSession? = nil, references: [ReferenceItem]? = nil, projectDocument: ProjectDocument? = nil) {
+    init(name: String, mode: CanvasMode = .threeDimensional, meshType: MeshType, shape2DType: Shape2DType = .roundedRectangle, shaders: [ActiveShader], dataFlow: DataFlowConfig = DataFlowConfig(), dataFlow2D: DataFlow2DConfig = DataFlow2DConfig(), paramValues: [String: [Float]] = [:], objects2D: [Object2D]? = nil, sharedVertexCode2D: String? = nil, sharedFragmentCode2D: String? = nil, labSession: LabSession? = nil, references: [ReferenceItem]? = nil, projectDocument: ProjectDocument? = nil, designDoc: DesignDocument? = nil) {
         self.name = name
         self.mode = mode
         self.meshType = meshType
@@ -430,6 +431,7 @@ struct CanvasDocument: Codable {
         self.labSession = labSession
         self.references = references
         self.projectDocument = projectDocument
+        self.designDoc = designDoc
     }
     
     init(from decoder: Decoder) throws {
@@ -448,6 +450,7 @@ struct CanvasDocument: Codable {
         labSession = try container.decodeIfPresent(LabSession.self, forKey: .labSession)
         references = try container.decodeIfPresent([ReferenceItem].self, forKey: .references)
         projectDocument = try container.decodeIfPresent(ProjectDocument.self, forKey: .projectDocument)
+        designDoc = try container.decodeIfPresent(DesignDocument.self, forKey: .designDoc)
     }
 }
 
@@ -466,7 +469,7 @@ struct RecentProject: Codable, Identifiable, Equatable {
 // MARK: - Plan Node Status
 
 /// Lifecycle state of a single node in an `AgentPlan` task tree.
-enum PlanNodeStatus: String, Codable {
+nonisolated enum PlanNodeStatus: String, Codable, Sendable {
     case pending
     case running
     case completed
@@ -481,7 +484,7 @@ enum PlanNodeStatus: String, Codable {
 /// The tree mirrors the GDC "paradigm" concept: each node is an atomic task
 /// with explicit context dependencies and outputs. Children can run in parallel
 /// when they share no data dependencies.
-struct PlanNode: Identifiable, Codable {
+nonisolated struct PlanNode: Identifiable, Codable, Sendable {
     let id: UUID
     var title: String
     var description: String
@@ -511,7 +514,7 @@ struct PlanNode: Identifiable, Codable {
 ///
 /// Serializable to JSON so it can be inspected, saved alongside the canvas document,
 /// and resumed across sessions.
-struct AgentPlan: Identifiable, Codable {
+nonisolated struct AgentPlan: Identifiable, Codable, Sendable {
     let id: UUID
     var title: String
     var status: PlanNodeStatus
@@ -560,8 +563,8 @@ struct ShaderSemantics: Codable {
 // MARK: - Stream Chunk (SSE)
 
 /// A single token/fragment delivered via Server-Sent Events during streaming.
-struct StreamChunk {
-    enum ChunkType { case thinking, content, planJSON }
+nonisolated struct StreamChunk: Sendable {
+    enum ChunkType: Sendable { case thinking, content, planJSON }
     let type: ChunkType
     let delta: String
 }
@@ -580,7 +583,7 @@ struct StreamChunk {
 /// - `setSharedShader2D`: set the shared distortion (vertex) or fragment code
 /// - `setObjectShader2D`: set per-object custom distortion or fragment code
 /// - `requestShapeLock`: request to lock an object's shape to gain SDF access
-enum AgentActionType: String, Codable {
+nonisolated enum AgentActionType: String, Codable, Sendable {
     case addLayer
     case modifyLayer
     case addObject2D
@@ -607,7 +610,7 @@ enum AgentActionType: String, Codable {
 ///   - `category`: "distortion" (vertex) | "fragment"
 ///   - `code`: MSL source for the shader
 ///   - `targetObjectName`: (setObjectShader2D only) target object name
-struct AgentAction: Codable {
+nonisolated struct AgentAction: Codable, Sendable {
     let type: AgentActionType
     let category: String
     let name: String
@@ -683,7 +686,7 @@ struct AgentAction: Codable {
 /// - `explanation`: natural language explanation for the user
 /// - `actions`: concrete layer operations to execute (add/modify)
 /// - `barriers`: technical limitations preventing fulfillment (when canFulfill is false)
-struct AgentResponse: Codable {
+nonisolated struct AgentResponse: Codable, Sendable {
     let canFulfill: Bool
     let explanation: String
     let actions: [AgentAction]

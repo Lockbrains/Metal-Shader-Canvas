@@ -2,16 +2,9 @@
 //  LabChatView.swift
 //  macOSShaderCanvas
 //
-//  Phase-driven collaborative discussion view for Lab mode.
-//  Unlike AIChatView's Direct/Plan modes, LabChatView is organized around
-//  the Lab workflow phases: Reference Analysis → Q&A → Document Drafting →
-//  Implementation → Tuning → Adversarial Generation.
-//
-//  Key differences from AIChatView:
-//  - Phase indicator at top showing current workflow stage
-//  - Reference embedding from the Reference Board
-//  - AI messages can contain actionable parameter suggestions
-//  - Phase-appropriate input prompts and AI behavior
+//  Conversation-driven collaborative discussion view for Lab mode.
+//  The AI decides autonomously what actions to take (document updates,
+//  parameter suggestions, etc.) based on conversation context.
 //
 
 import SwiftUI
@@ -24,6 +17,8 @@ struct LabChatView: View {
     @Binding var labSession: LabSession
     let references: [ReferenceItem]
     @Binding var projectDocument: ProjectDocument
+    @Binding var designDoc: DesignDocument
+    @Binding var paramValues: [String: [Float]]
     let activeShaders: [ActiveShader]
     let aiSettings: AISettings
     let canvasMode: CanvasMode
@@ -33,7 +28,6 @@ struct LabChatView: View {
     let sharedVertexCode2D: String
     let sharedFragmentCode2D: String
     let compilationError: String?
-    let paramValues: [String: [Float]]
     let meshType: MeshType
     let onAgentActions: ([AgentAction]) -> Void
 
@@ -62,30 +56,14 @@ struct LabChatView: View {
                 .font(.system(size: 11))
                 .foregroundColor(.purple)
 
-            Text("Collaborative Discussion")
+            Text("Lab Discussion")
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundColor(.white.opacity(0.8))
 
             Spacer()
-
-            phaseContextBadge
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-    }
-
-    private var phaseContextBadge: some View {
-        HStack(spacing: 3) {
-            Image(systemName: labSession.currentPhase.icon)
-                .font(.system(size: 8))
-            Text(labSession.currentPhase.displayName)
-                .font(.system(size: 9, weight: .medium))
-        }
-        .foregroundColor(.cyan)
-        .padding(.horizontal, 6)
-        .padding(.vertical, 2)
-        .background(Color.cyan.opacity(0.12))
-        .cornerRadius(4)
     }
 
     // MARK: - Message List
@@ -140,7 +118,10 @@ struct LabChatView: View {
                     .equatable()
 
                 if let actions = message.executedActions, !actions.isEmpty {
-                    actionsSummary(actions)
+                    agentActionsSummary(actions)
+                }
+                if let labActions = message.executedLabActions, !labActions.isEmpty {
+                    labActionsSummary(labActions)
                 }
             }
             .padding(10)
@@ -161,7 +142,7 @@ struct LabChatView: View {
         }
     }
 
-    private func actionsSummary(_ actions: [AgentAction]) -> some View {
+    private func agentActionsSummary(_ actions: [AgentAction]) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             ForEach(actions.indices, id: \.self) { i in
                 HStack(spacing: 4) {
@@ -177,25 +158,73 @@ struct LabChatView: View {
         .padding(.top, 4)
     }
 
+    private func labActionsSummary(_ actions: [LabAction]) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            ForEach(actions.indices, id: \.self) { i in
+                let action = actions[i]
+                HStack(spacing: 4) {
+                    Image(systemName: labActionIcon(action.type))
+                        .font(.system(size: 8))
+                        .foregroundColor(labActionColor(action.type))
+                    Text(action.displaySummary)
+                        .font(.system(size: 9))
+                        .foregroundColor(.white.opacity(0.5))
+
+                    if action.type == .suggestParamChange, let changes = action.paramChanges {
+                        Spacer()
+                        Button(action: { applyParamSuggestion(changes) }) {
+                            Text("Apply")
+                                .font(.system(size: 8, weight: .semibold))
+                                .foregroundColor(.cyan)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.cyan.opacity(0.15))
+                                .cornerRadius(3)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+        }
+        .padding(.top, 4)
+        .padding(6)
+        .background(Color.purple.opacity(0.08))
+        .cornerRadius(6)
+    }
+
+    private func labActionIcon(_ type: LabActionType) -> String {
+        switch type {
+        case .updateDesignDoc:       return "doc.text.fill"
+        case .updateProjectDoc:      return "doc.richtext.fill"
+        case .updateDocumentSection: return "doc.text.fill"
+        case .addParameter:          return "slider.horizontal.3"
+        case .addConstraint:         return "exclamationmark.triangle.fill"
+        case .suggestParamChange:    return "tuningfork"
+        case .logIteration:          return "clock.arrow.circlepath"
+        }
+    }
+
+    private func labActionColor(_ type: LabActionType) -> Color {
+        switch type {
+        case .updateDesignDoc:       return .cyan.opacity(0.8)
+        case .updateProjectDoc:      return .mint.opacity(0.8)
+        case .updateDocumentSection: return .cyan.opacity(0.8)
+        case .addParameter:          return .green.opacity(0.8)
+        case .addConstraint:         return .orange.opacity(0.8)
+        case .suggestParamChange:    return .yellow.opacity(0.8)
+        case .logIteration:          return .purple.opacity(0.8)
+        }
+    }
+
     private var loadingIndicator: some View {
         HStack(spacing: 8) {
             ProgressView().scaleEffect(0.6)
-            Text(phaseLoadingText)
+            Text("Thinking...")
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundColor(.white.opacity(0.4))
         }
         .padding(.horizontal, 12)
         .id("loading")
-    }
-
-    private var phaseLoadingText: String {
-        switch labSession.currentPhase {
-        case .referenceInput, .analysis: return "Analyzing references..."
-        case .documentDrafting: return "Drafting document..."
-        case .implementation: return "Writing shader..."
-        case .tuning: return "Evaluating parameters..."
-        case .adversarial: return "Generating alternatives..."
-        }
     }
 
     // MARK: - Error Banner
@@ -287,14 +316,7 @@ struct LabChatView: View {
     }
 
     private var inputPlaceholder: String {
-        switch labSession.currentPhase {
-        case .referenceInput:   return "Describe what you want to create..."
-        case .analysis:         return "Answer AI's questions or ask your own..."
-        case .documentDrafting: return "Review and suggest document changes..."
-        case .implementation:   return "Request shader implementation..."
-        case .tuning:           return "Describe parameter adjustments..."
-        case .adversarial:      return "Respond to AI's proposals..."
-        }
+        "Describe your idea, ask questions, or request changes..."
     }
 
     private var canSubmit: Bool {
@@ -307,24 +329,33 @@ struct LabChatView: View {
 
     private func handleSubmit() {
         guard canSubmit else { return }
-        let t0 = CFAbsoluteTimeGetCurrent()
-        print("[LAB-SEND] handleSubmit START")
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         inputText = ""
 
         var userMsg = ChatMessage(role: .user, content: text)
         userMsg.userImage = pendingUserImage
         chatStore.messages.append(userMsg)
-        print("[LAB-SEND] state mutations done  +\(Int((CFAbsoluteTimeGetCurrent()-t0)*1000))ms")
 
         let refs = references
         let imageData = pendingUserImage
         pendingUserImage = nil
 
+        let captured = aiSettings.captured
+        let phase = labSession.currentPhase
         isLoading = true
-        print("[LAB-SEND] handleSubmit END (Task scheduled)  +\(Int((CFAbsoluteTimeGetCurrent()-t0)*1000))ms")
+
+        sendLabRequest(text: text, phase: phase, refs: refs, imageData: imageData, captured: captured)
+    }
+
+    /// Unified request handler for all Lab phases.
+    /// Uses the non-streaming sendMessage path (same underlying API calls as Canvas mode)
+    /// with structured LabAgentResponse parsing and Lab action execution.
+    private func sendLabRequest(text: String, phase: LabPhase, refs: [ReferenceItem], imageData: Data?, captured: CapturedAISettings) {
+        // dropLast() removes the user message we just appended in handleSubmit;
+        // sendMessage will re-add it as the final user turn.
+        let history = Array(chatStore.messages.dropLast())
+
         Task {
-            print("[LAB-SEND] Task body START  +\(Int((CFAbsoluteTimeGetCurrent()-t0)*1000))ms")
             do {
                 let refImages = await Task.detached { [refs] in
                     Self.compressReferenceImages(refs)
@@ -332,9 +363,10 @@ struct LabChatView: View {
 
                 let response = try await LabAIFlow.sendMessage(
                     text: text,
-                    phase: labSession.currentPhase,
+                    phase: phase,
                     references: refs,
                     projectDocument: projectDocument,
+                    designDoc: designDoc,
                     activeShaders: activeShaders,
                     canvasMode: canvasMode,
                     dataFlowConfig: dataFlowConfig,
@@ -344,22 +376,26 @@ struct LabChatView: View {
                     sharedFragmentCode2D: sharedFragmentCode2D,
                     paramValues: paramValues,
                     meshType: meshType,
-                    chatHistory: chatStore.messages,
-                    settings: aiSettings,
+                    chatHistory: history,
+                    captured: captured,
                     imageData: imageData,
                     referenceImages: refImages
                 )
 
                 await MainActor.run {
                     var assistantMsg = ChatMessage(role: .assistant, content: response.explanation)
-                    if !response.actions.isEmpty {
-                        assistantMsg.executedActions = response.actions
-                        onAgentActions(response.actions)
+
+                    if let agentActions = response.agentActions, !agentActions.isEmpty {
+                        assistantMsg.executedActions = agentActions
+                        onAgentActions(agentActions)
                     }
+                    if !response.labActions.isEmpty {
+                        assistantMsg.executedLabActions = response.labActions
+                        executeLabActions(response.labActions)
+                    }
+
                     chatStore.messages.append(assistantMsg)
                     isLoading = false
-
-                    updateDocumentFromResponse(response)
                 }
             } catch {
                 await MainActor.run {
@@ -370,12 +406,88 @@ struct LabChatView: View {
         }
     }
 
-    private func updateDocumentFromResponse(_ response: AgentResponse) {
-        guard labSession.currentPhase == .analysis || labSession.currentPhase == .documentDrafting else { return }
-        if projectDocument.referenceAnalysis.isEmpty && !response.explanation.isEmpty
-            && labSession.currentPhase == .analysis {
-            projectDocument.referenceAnalysis = response.explanation
+    // MARK: - Lab Action Execution
+
+    private func executeLabActions(_ actions: [LabAction]) {
+        for action in actions {
+            switch action.type {
+            case .updateDesignDoc:
+                guard let content = action.content, !content.isEmpty else { continue }
+                if designDoc.markdown.isEmpty {
+                    designDoc.markdown = content
+                } else {
+                    designDoc.markdown += "\n\n" + content
+                }
+                designDoc.lastModified = Date()
+                print("[LAB-ACTION] updateDesignDoc: \(content.prefix(60))...")
+
+            case .updateProjectDoc:
+                guard let content = action.content, !content.isEmpty else { continue }
+                if projectDocument.markdown.isEmpty {
+                    projectDocument.markdown = content
+                } else {
+                    projectDocument.markdown += "\n\n" + content
+                }
+                projectDocument.lastModified = Date()
+                print("[LAB-ACTION] updateProjectDoc: \(content.prefix(60))...")
+
+            case .updateDocumentSection:
+                guard let content = action.content, !content.isEmpty else { continue }
+                if designDoc.markdown.isEmpty {
+                    designDoc.markdown = content
+                } else {
+                    designDoc.markdown += "\n\n" + content
+                }
+                designDoc.lastModified = Date()
+                print("[LAB-ACTION] updateDocumentSection (legacy -> designDoc)")
+
+            case .addParameter:
+                guard let name = action.paramName, !name.isEmpty else { continue }
+                let exists = projectDocument.parameterDesign.contains { $0.name == name }
+                if exists { continue }
+                let paramType = ParamType(rawValue: action.paramType ?? "float") ?? .float
+                let defaults = action.paramDefault ?? [1.0]
+                let spec = ParamSpec(
+                    name: name,
+                    purpose: action.paramPurpose ?? "",
+                    type: paramType,
+                    suggestedDefault: defaults,
+                    suggestedMin: action.paramMin,
+                    suggestedMax: action.paramMax
+                )
+                projectDocument.parameterDesign.append(spec)
+                if paramValues[name] == nil {
+                    paramValues[name] = defaults
+                }
+                print("[LAB-ACTION] addParameter: \(name) = \(defaults)")
+
+            case .addConstraint:
+                guard let constraint = action.constraint, !constraint.isEmpty else { continue }
+                if !projectDocument.constraints.contains(constraint) {
+                    projectDocument.constraints.append(constraint)
+                    print("[LAB-ACTION] addConstraint: \(constraint)")
+                }
+
+            case .suggestParamChange:
+                print("[LAB-ACTION] suggestParamChange: \(action.paramChanges?.keys.joined(separator: ", ") ?? "none")")
+
+            case .logIteration:
+                let entry = IterationEntry(
+                    description: action.iterationDescription ?? "",
+                    decision: action.iterationDecision ?? "",
+                    outcome: action.iterationOutcome ?? "pending"
+                )
+                projectDocument.iterationLog.append(entry)
+                print("[LAB-ACTION] logIteration: \(entry.description)")
+            }
         }
+    }
+
+    private func applyParamSuggestion(_ changes: [String: [Float]]) {
+        for (name, values) in changes {
+            paramValues[name] = values
+        }
+        print("[LAB-ACTION] Applied param suggestion: \(changes.keys.joined(separator: ", "))")
     }
 
     private func attachReference() {
@@ -386,7 +498,7 @@ struct LabChatView: View {
 
     private func captureRender() {
         Task {
-            let capture = await Task.detached { MetalRenderer.current?.captureForAI() }.value
+            let capture = await Task.detached { await MetalRenderer.current?.captureForAI() }.value
             if let data = capture { pendingUserImage = data }
         }
     }
@@ -394,7 +506,7 @@ struct LabChatView: View {
     /// Collects and compresses reference images for the AI API call.
     /// Limited to 4 images to keep request size reasonable.
     /// Static so it can be called from Task.detached without capturing self.
-    private static func compressReferenceImages(_ references: [ReferenceItem]) -> [Data] {
+    private nonisolated static func compressReferenceImages(_ references: [ReferenceItem]) -> [Data] {
         let imageRefs = references.filter { $0.type == .image || $0.type == .gif }
         let maxImages = 4
         var result: [Data] = []

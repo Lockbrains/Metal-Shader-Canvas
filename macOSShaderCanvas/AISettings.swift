@@ -34,7 +34,7 @@ import SwiftUI
 /// - A default model (used on first launch)
 /// - A list of available models (shown in the settings picker)
 /// - Different API endpoints and authentication mechanisms
-enum AIProvider: String, CaseIterable, Identifiable, Codable {
+nonisolated enum AIProvider: String, CaseIterable, Identifiable, Codable, Sendable {
     case openai = "OpenAI"
     case anthropic = "Anthropic"
     case gemini = "Gemini"
@@ -137,19 +137,20 @@ class AISettings {
 ///
 /// Each message has a role (user/assistant/system), content text,
 /// and a timestamp. The UUID enables SwiftUI list identification.
-struct ChatMessage: Identifiable {
+nonisolated struct ChatMessage: Identifiable, Sendable {
     let id = UUID()
     let role: MessageRole
     var content: String
     let timestamp = Date()
     var executedActions: [AgentAction]? = nil
+    var executedLabActions: [LabAction]? = nil
     var barriers: [String]? = nil
     var thinking: String? = nil
     var plan: AgentPlan? = nil
     var renderSnapshot: Data? = nil
     var userImage: Data? = nil
 
-    enum MessageRole: String { case user, assistant, system }
+    nonisolated enum MessageRole: String, Sendable { case user, assistant, system }
 }
 
 // MARK: - AI Settings View

@@ -144,7 +144,7 @@ struct AdversarialView: View {
                                 Text(key)
                                     .font(.system(size: 9, design: .monospaced))
                                     .foregroundColor(.cyan.opacity(0.7))
-                                Text("→")
+                                Text("\u{2192}")
                                     .font(.system(size: 8))
                                     .foregroundColor(.white.opacity(0.3))
                                 Text(vals.map { String(format: "%.2f", $0) }.joined(separator: ", "))
@@ -155,6 +155,30 @@ struct AdversarialView: View {
                     }
                     .padding(6)
                     .background(Color.white.opacity(0.03))
+                    .cornerRadius(4)
+                }
+
+                if let codeChanges = proposal.codeChanges, !codeChanges.isEmpty {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Proposed Code Changes:")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.5))
+                        ForEach(Array(codeChanges.keys.sorted()), id: \.self) { layerName in
+                            HStack(spacing: 4) {
+                                Image(systemName: "doc.text")
+                                    .font(.system(size: 8))
+                                    .foregroundColor(.purple.opacity(0.7))
+                                Text(layerName)
+                                    .font(.system(size: 9, design: .monospaced))
+                                    .foregroundColor(.purple.opacity(0.8))
+                                Text("\((codeChanges[layerName] ?? "").count) chars")
+                                    .font(.system(size: 8))
+                                    .foregroundColor(.white.opacity(0.3))
+                            }
+                        }
+                    }
+                    .padding(6)
+                    .background(Color.purple.opacity(0.06))
                     .cornerRadius(4)
                 }
 
@@ -234,15 +258,16 @@ struct AdversarialView: View {
         let currentCode = activeShaders.map(\.code).joined(separator: "\n\n")
         let currentParams = paramValues
         let doc = projectDocument
+        let captured = aiSettings.captured
 
         Task {
             do {
-                let capture = await Task.detached { MetalRenderer.current?.captureForAI() }.value
+                let capture = await Task.detached { await MetalRenderer.current?.captureForAI() }.value
                 let proposal = try await LabAIFlow.proposeAlternative(
                     currentCode: currentCode,
                     paramValues: currentParams,
                     projectDocument: doc,
-                    settings: aiSettings,
+                    captured: captured,
                     renderCapture: capture
                 )
                 await MainActor.run {
@@ -265,6 +290,16 @@ struct AdversarialView: View {
             if let paramChanges = proposal.paramChanges {
                 for (key, vals) in paramChanges {
                     paramValues[key] = vals
+                }
+            }
+
+            if let codeChanges = proposal.codeChanges {
+                for (layerName, code) in codeChanges {
+                    if let shaderIdx = activeShaders.firstIndex(where: { $0.name == layerName }) {
+                        activeShaders[shaderIdx].code = code
+                    } else {
+                        onApplyCode(layerName, code)
+                    }
                 }
             }
         }
