@@ -345,10 +345,17 @@ struct ShaderSnippets {
     }
 
     /// Packs current parameter values into a flat float array for GPU upload.
-    static func packParamBuffer(params: [ShaderParam], values: [String: [Float]]) -> [Float] {
+    /// When `scopeKey` is provided, tries `scopeKey/paramName` first, then
+    /// falls back to `paramName` for backward compatibility.
+    static func packParamBuffer(params: [ShaderParam], values: [String: [Float]], scopeKey: String = "") -> [Float] {
         var buffer: [Float] = []
         for param in params {
-            let vals = values[param.name] ?? param.defaultValue
+            let vals: [Float]
+            if !scopeKey.isEmpty, let scoped = values["\(scopeKey)/\(param.name)"] {
+                vals = scoped
+            } else {
+                vals = values[param.name] ?? param.defaultValue
+            }
             for i in 0..<param.type.componentCount {
                 buffer.append(i < vals.count ? vals[i] : 0)
             }

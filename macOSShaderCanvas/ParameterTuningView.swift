@@ -39,15 +39,92 @@ struct ParameterTuningView: View {
         case compare = "A/B Compare"
     }
 
-    private var allParams: [ShaderParam] {
-        var params: [ShaderParam] = []
-        for shader in activeShaders {
-            params.append(contentsOf: ShaderSnippets.parseParams(from: shader.code))
-        }
+    private struct ParamGroup: Identifiable {
+        var id: String { scopeKey.isEmpty ? "global-\(label)" : scopeKey }
+        let label: String
+        let params: [ShaderParam]
+        /// Object/shader UUID string used to scope parameter keys.
+        /// Empty string means global (unscoped).
+        let scopeKey: String
+    }
+
+    private var groupedParams: [ParamGroup] {
+        var groups: [ParamGroup] = []
+        var allFoundNames: Set<String> = []
+
         if canvasMode.is2D {
-            params.append(contentsOf: ShaderSnippets.parseParams(from: sharedFragmentCode2D))
+            for obj in objects2D {
+                var objParams: [ShaderParam] = []
+                if let vs = obj.customVertexCode {
+                    for p in ShaderSnippets.parseParams(from: vs) {
+                        objParams.append(p)
+                    }
+                }
+                if let fs = obj.customFragmentCode {
+                    for p in ShaderSnippets.parseParams(from: fs) {
+                        if !objParams.contains(where: { $0.name == p.name }) {
+                            objParams.append(p)
+                        }
+                    }
+                }
+                if !objParams.isEmpty {
+                    allFoundNames.formUnion(objParams.map(\.name))
+                    groups.append(ParamGroup(label: obj.name, params: objParams, scopeKey: obj.id.uuidString))
+                }
+            }
+            var sharedParams: [ShaderParam] = []
+            for p in ShaderSnippets.parseParams(from: sharedFragmentCode2D) {
+                sharedParams.append(p)
+            }
+            if !sharedParams.isEmpty {
+                allFoundNames.formUnion(sharedParams.map(\.name))
+                groups.append(ParamGroup(label: "Shared", params: sharedParams, scopeKey: ""))
+            }
         }
-        return params
+
+        for shader in activeShaders {
+            var shaderParams: [ShaderParam] = []
+            for p in ShaderSnippets.parseParams(from: shader.code) {
+                shaderParams.append(p)
+            }
+            if !shaderParams.isEmpty {
+                allFoundNames.formUnion(shaderParams.map(\.name))
+                groups.append(ParamGroup(label: shader.name, params: shaderParams, scopeKey: shader.id.uuidString))
+            }
+        }
+
+        let designParams = projectDocument.parameterDesign.filter { !allFoundNames.contains($0.name) }
+        if !designParams.isEmpty {
+            let converted = designParams.map { spec in
+                ShaderParam(
+                    name: spec.name,
+                    type: spec.type,
+                    defaultValue: spec.suggestedDefault,
+                    minValue: spec.suggestedMin,
+                    maxValue: spec.suggestedMax
+                )
+            }
+            groups.append(ParamGroup(label: "Registered", params: converted, scopeKey: ""))
+        }
+
+        return groups
+    }
+
+    private var allParams: [ShaderParam] {
+        groupedParams.flatMap(\.params)
+    }
+
+    /// Returns the scoped parameter key for a given group and param.
+    private func paramKey(scope: String, name: String) -> String {
+        scope.isEmpty ? name : "\(scope)/\(name)"
+    }
+
+    /// Reads a parameter value using scoped key with fallback to global key.
+    private func readParam(scope: String, param: ShaderParam) -> [Float] {
+        if !scope.isEmpty, let scoped = paramValues["\(scope)/\(param.name)"] {
+            return scoped
+        }
+        return paramValues[param.name] ?? param.defaultValue
     }
 
     var body: some View {
@@ -127,8 +204,28 @@ struct ParameterTuningView: View {
                 VStack(spacing: 8) {
                     aiFeedbackBanner
 
-                    ForEach(allParams, id: \.name) { param in
-                        parameterSlider(param)
+                    ForEach(groupedParams) { group in
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(spacing: 4) {
+                                Image(systemName: "cube")
+                                    .font(.system(size: 8))
+                                    .foregroundColor(.white.opacity(0.3))
+                                Text(group.label)
+                                    .font(.system(size: 9, weight: .semibold))
+                                    .foregroundColor(.white.opacity(0.4))
+                                    .textCase(.uppercase)
+                                Spacer()
+                                Text("\(group.params.count)")
+                                    .font(.system(size: 8))
+                                    .foregroundColor(.white.opacity(0.2))
+                            }
+                            .padding(.horizontal, 4)
+                            .padding(.top, group.id == groupedParams.first?.id ? 0 : 4)
+
+                            ForEach(group.params, id: \.name) { param in
+                                parameterSlider(param, scopeKey: group.scopeKey)
+                            }
+                        }
                     }
                 }
                 .padding(10)
@@ -185,7 +282,7 @@ struct ParameterTuningView: View {
         }
     }
 
-    private func parameterSlider(_ param: ShaderParam) -> some View {
+    private func parameterSlider(_ param: ShaderParam, scopeKey: String = "") -> some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack {
                 Text(param.name.hasPrefix("_") ? String(param.name.dropFirst()) : param.name)
@@ -195,39 +292,40 @@ struct ParameterTuningView: View {
                     .font(.system(size: 9))
                     .foregroundColor(.white.opacity(0.3))
                 Spacer()
-                Text(currentValueText(param))
+                Text(currentValueText(param, scopeKey: scopeKey))
                     .font(.system(size: 9, design: .monospaced))
                     .foregroundColor(.white.opacity(0.5))
             }
 
             if param.type == .color {
-                colorControl(param)
+                colorControl(param, scopeKey: scopeKey)
             } else {
                 ForEach(0..<param.type.componentCount, id: \.self) { comp in
-                    sliderRow(param: param, component: comp)
+                    sliderRow(param: param, component: comp, scopeKey: scopeKey)
                 }
             }
 
-            sensitivityIndicator(param)
+            sensitivityIndicator(param, scopeKey: scopeKey)
         }
         .padding(8)
         .background(Color.white.opacity(0.03))
         .cornerRadius(6)
     }
 
-    private func sliderRow(param: ShaderParam, component: Int) -> some View {
+    private func sliderRow(param: ShaderParam, component: Int, scopeKey: String = "") -> some View {
         let minVal = param.minValue ?? 0.0
         let maxVal = param.maxValue ?? (param.type == .color ? 1.0 : 10.0)
+        let key = paramKey(scope: scopeKey, name: param.name)
         let binding = Binding<Float>(
             get: {
-                let vals = paramValues[param.name] ?? param.defaultValue
+                let vals = readParam(scope: scopeKey, param: param)
                 return component < vals.count ? vals[component] : param.defaultValue.first ?? 0
             },
             set: { newVal in
-                var vals = paramValues[param.name] ?? param.defaultValue
+                var vals = readParam(scope: scopeKey, param: param)
                 while vals.count <= component { vals.append(0) }
                 vals[component] = newVal
-                paramValues[param.name] = vals
+                paramValues[key] = vals
             }
         )
 
@@ -247,8 +345,8 @@ struct ParameterTuningView: View {
         }
     }
 
-    private func colorControl(_ param: ShaderParam) -> some View {
-        let vals = paramValues[param.name] ?? param.defaultValue
+    private func colorControl(_ param: ShaderParam, scopeKey: String = "") -> some View {
+        let vals = readParam(scope: scopeKey, param: param)
         let r = vals.count > 0 ? Double(vals[0]) : 1.0
         let g = vals.count > 1 ? Double(vals[1]) : 1.0
         let b = vals.count > 2 ? Double(vals[2]) : 1.0
@@ -261,20 +359,19 @@ struct ParameterTuningView: View {
 
             VStack(spacing: 2) {
                 ForEach(0..<3, id: \.self) { comp in
-                    sliderRow(param: param, component: comp)
+                    sliderRow(param: param, component: comp, scopeKey: scopeKey)
                 }
             }
         }
     }
 
-    /// Visual indicator showing how sensitive the visual output is to this parameter.
-    private func sensitivityIndicator(_ param: ShaderParam) -> some View {
+    private func sensitivityIndicator(_ param: ShaderParam, scopeKey: String = "") -> some View {
         HStack(spacing: 3) {
             Image(systemName: "waveform.path")
                 .font(.system(size: 8))
                 .foregroundColor(.white.opacity(0.2))
             GeometryReader { geo in
-                let vals = paramValues[param.name] ?? param.defaultValue
+                let vals = readParam(scope: scopeKey, param: param)
                 let normalizedPosition = normalizedParameterPosition(param: param, values: vals)
                 RoundedRectangle(cornerRadius: 1)
                     .fill(Color.cyan.opacity(0.2))
@@ -290,8 +387,8 @@ struct ParameterTuningView: View {
         return max(0, min(1, (val - minVal) / (maxVal - minVal)))
     }
 
-    private func currentValueText(_ param: ShaderParam) -> String {
-        let vals = paramValues[param.name] ?? param.defaultValue
+    private func currentValueText(_ param: ShaderParam, scopeKey: String = "") -> String {
+        let vals = readParam(scope: scopeKey, param: param)
         return vals.map { String(format: "%.2f", $0) }.joined(separator: ", ")
     }
 

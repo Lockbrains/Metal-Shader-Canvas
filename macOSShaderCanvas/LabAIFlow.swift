@@ -91,8 +91,8 @@ enum LabAIFlow {
         // Zero or more lab actions (doc updates, params, constraints, etc.)
       ],
       "agentActions": [
-        // Zero or more shader code actions (addLayer, modifyLayer, etc.)
-        // Only include when you are writing/modifying actual shader code
+        // Zero or more shader code actions (addObject2D, setObjectShader2D, addLayer, etc.)
+        // ALWAYS include setObjectShader2D with full shader code for every addObject2D
       ]
     }
     The "explanation" field is shown directly to the user as chat — be conversational, collaborative, and thorough.
@@ -124,8 +124,9 @@ enum LabAIFlow {
         - For significant design decisions: write the plan in the Design Doc first, then implement
         - Proactively update the Design Doc as the conversation evolves (analysis results, technical approach, decisions made)
         - When implementation is complete, summarize into the Project Doc (final technical documentation)
-        - Parameters added via addParameter create real sliders — use // @param comments in shader code to match them
+        - The // @param directives in shader code are what create real UI sliders. addParameter only pre-registers defaults. ALWAYS include // @param in your shader code for every user-adjustable value.
         - You can combine labActions and agentActions in the same response
+        - ⚠️ ALWAYS write COMPLETE implementations: every addObject2D MUST have a matching setObjectShader2D with actual shader code in the SAME response. Objects without custom shaders render as plain default gradients and look broken. NEVER split object creation and shader writing across multiple turns.
 
         AVAILABLE ACTIONS (labActions array):
         1. Update Design Doc (collaborative plan):
@@ -183,6 +184,16 @@ enum LabAIFlow {
             - To apply post-processing effects (blur, bloom, vignette, color grading) → addLayer with category "fullscreen"
             - Fullscreen layers MUST sample from inTexture and blend/modify it — NEVER generate opaque procedural content
             - For custom SDF shapes (heart, star, etc.), draw them INSIDE an object's fragment shader using the object's UV space
+
+            ⚠️⚠️⚠️ CRITICAL — ALWAYS PAIR addObject2D WITH setObjectShader2D IN THE SAME RESPONSE:
+            An addObject2D WITHOUT a matching setObjectShader2D renders with a PLAIN DEFAULT
+            GRADIENT — it will NOT have any custom appearance! The user will see a broken result.
+            You MUST include BOTH addObject2D AND setObjectShader2D for EVERY object that needs
+            a custom material in the SAME JSON response. NEVER create objects "first" and plan
+            to write shaders "later" — that leaves objects looking broken.
+            If the scene requires multiple custom objects, write ALL of them in ONE response.
+            It is better to write one complete object (addObject2D + setObjectShader2D) than
+            to create four empty objects with no custom shaders.
 
             SHADER CODE ACTIONS (agentActions array):
             Include these in the "agentActions" field of your JSON response.
@@ -260,16 +271,27 @@ enum LabAIFlow {
             - Write ONLY the fragment_main function.
             - Signature: fragment float4 fragment_main(VertexOut in [[stage_in]], constant Uniforms &uniforms [[buffer(1)]])
             - SDF edge clipping is applied automatically by the system — just output the color.
-            - Available VertexOut fields: in.texCoord (float2, shape-local UV [0,1])
+            - Available VertexOut fields:
+              • in.texCoord (float2) — shape-local UV [0,1]
+              • in.shapeAspect (float) — combined screen-space aspect ratio of the object (accounts for shape preset, object scale, AND viewport aspect)
+              • in.cornerRadius (float) — corner radius for rounded shapes
             - Available uniforms: .resolution (float2), .time (float), .mouseX/.mouseY (float)
 
             CUSTOM SDF SHAPES INSIDE OBJECT FRAGMENT SHADERS:
             You can draw ANY SDF shape inside an object's fragment shader using its texCoord space.
             The object's base shape provides clipping; your shader paints whatever you want inside.
+
+            ⚠️ ASPECT RATIO CORRECTION — CRITICAL FOR ALL SDF SHAPES:
+            in.texCoord is [0,1] in both axes regardless of the object's actual screen proportions.
+            You MUST use in.shapeAspect to correct for the object's screen-space aspect ratio,
+            otherwise circles become ovals and rounded rects get stretched.
+            Correct pattern:  float2 p = (in.texCoord - 0.5) * float2(in.shapeAspect, 1.0);
+            WRONG pattern:    float2 p = in.texCoord * 2.0 - 1.0;  // IGNORES aspect → shapes stretch!
+
             Example — heart SDF inside a Circle object:
               fragment float4 fragment_main(VertexOut in [[stage_in]], constant Uniforms &uniforms [[buffer(1)]]) {
-                  float2 p = in.texCoord * 2.0 - 1.0;  // remap to [-1, 1]
-                  // Heart SDF (Inigo Quilez)
+                  float2 p = (in.texCoord - 0.5) * float2(in.shapeAspect, 1.0);
+                  // Heart SDF (Inigo Quilez) — works correctly at any viewport size
                   p.x = abs(p.x);
                   float d = length(p - float2(0.25, -0.3)) < ... ;  // your SDF math
                   float3 col = mix(float3(0.1), float3(1, 0.2, 0.3), smoothstep(0.01, -0.01, d));

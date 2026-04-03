@@ -1061,7 +1061,7 @@ struct ContentView: View {
     private func performOpen() {
         let panel = NSOpenPanel()
         panel.title = String(localized: "Open Canvas")
-        panel.allowedContentTypes = [.shaderCanvas]
+        panel.allowedContentTypes = [.shaderCanvas, .shaderLab]
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
 
@@ -2285,47 +2285,9 @@ struct CodeEditor: NSViewRepresentable {
 
         // MARK: - Syntax Highlighting
 
-        /// Regex-based syntax highlighting rules for Metal Shading Language.
-        /// Rules are applied in order; later rules override earlier ones for overlapping matches.
-        ///
-        /// Color scheme:
-        /// - Pink: keywords (vertex, fragment, kernel, return, struct, etc.)
-        /// - Cyan: types (float, float4, texture2d, void, etc.)
-        /// - Yellow: built-in functions (sin, cos, dot, normalize, etc.)
-        /// - Orange: attributes ([[position]], [[stage_in]], etc.)
-        /// - Green: numeric literals (1.0, 42, etc.)
-        /// - Orange: preprocessor directives (#include, #define, etc.)
-        /// - Gray-green: comments (// ...)
-        private let highlightRules: [(String, NSColor, NSRegularExpression.Options)] = [
-            ("\\b(include|using|namespace|struct|vertex|fragment|kernel|constant|device|thread|threadgroup|return|constexpr|sampler|address|filter)\\b", NSColor(red: 0.9, green: 0.4, blue: 0.6, alpha: 1.0), []),
-            ("\\b(float|float2|float3|float4|float4x4|float3x3|half|half2|half3|half4|int|uint|uint2|uint3|uint4|texture2d|void|bool)\\b", NSColor(red: 0.3, green: 0.7, blue: 0.8, alpha: 1.0), []),
-            ("\\b(sin|cos|tan|max|min|clamp|dot|cross|normalize|length|distance|reflect|refract|mix|smoothstep|step|sample)\\b", NSColor(red: 0.8, green: 0.8, blue: 0.5, alpha: 1.0), []),
-            ("\\[\\[[^\\]]+\\]\\]", NSColor(red: 0.8, green: 0.6, blue: 0.4, alpha: 1.0), []),
-            ("\\b\\d+(\\.\\d+)?\\b", NSColor(red: 0.6, green: 0.8, blue: 0.6, alpha: 1.0), []),
-            ("^\\s*#.*", NSColor(red: 0.8, green: 0.5, blue: 0.3, alpha: 1.0), .anchorsMatchLines),
-            ("//.*", NSColor(red: 0.5, green: 0.6, blue: 0.5, alpha: 1.0), []),
-        ]
-
-        /// Applies regex-based syntax highlighting to the entire text.
-        /// Resets all text to the default color, then applies each rule's color
-        /// to matching ranges.
         func applyHighlighting(to textView: NSTextView) {
             guard let storage = textView.textStorage else { return }
-            let range = NSRange(location: 0, length: storage.length)
-            let content = storage.string
-            let font = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
-
-            storage.beginEditing()
-            storage.addAttribute(.foregroundColor, value: NSColor(white: 0.9, alpha: 1.0), range: range)
-            storage.addAttribute(.font, value: font, range: range)
-
-            for (pattern, color, opts) in highlightRules {
-                guard let regex = try? NSRegularExpression(pattern: pattern, options: opts) else { continue }
-                for match in regex.matches(in: content, range: range) {
-                    storage.addAttribute(.foregroundColor, value: color, range: match.range)
-                }
-            }
-            storage.endEditing()
+            MSLHighlighter.apply(to: storage)
         }
     }
 }

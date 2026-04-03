@@ -202,13 +202,17 @@ struct MetalView: NSViewRepresentable {
     // Kept for backward compat
     var shape2DType: Shape2DType = .roundedRectangle
 
+    // Debug mode: when true, the renderer won't set MetalRenderer.current
+    var isDebugMode: Bool = false
+    var debugFragmentOverrides: [UUID: String] = [:]
+
     // MARK: - NSViewRepresentable Lifecycle
 
     func makeNSView(context: Context) -> MTKView {
         let mtkView = TrackingMTKView()
         mtkView.device = MTLCreateSystemDefaultDevice()
 
-        if let renderer = MetalRenderer(metalView: mtkView) {
+        if let renderer = MetalRenderer(metalView: mtkView, isDebugRenderer: isDebugMode) {
             context.coordinator.renderer = renderer
         }
 
@@ -226,6 +230,9 @@ struct MetalView: NSViewRepresentable {
         renderer.paramValues = paramValues
         renderer.canvasMode = canvasMode
         renderer.shape2DType = shape2DType
+
+        let debugChanged = renderer.debugFragmentOverrides != debugFragmentOverrides
+        renderer.debugFragmentOverrides = debugFragmentOverrides
 
         var force2D = false
         if canvasMode.is2D {
@@ -251,10 +258,10 @@ struct MetalView: NSViewRepresentable {
             }
         }
 
-        // Heavy update — shader code, data flow, or 2D object state changed.
+        // Heavy update — shader code, data flow, debug override, or 2D object state changed.
         // Routes all compilation through updateShaders for epoch coordination.
-        if force2D || coord.needsShaderUpdate(shaders: activeShaders, dataFlow: dataFlowConfig) {
-            renderer.updateShaders(activeShaders, dataFlow: dataFlowConfig, in: nsView, force2DCompile: force2D)
+        if force2D || debugChanged || coord.needsShaderUpdate(shaders: activeShaders, dataFlow: dataFlowConfig) {
+            renderer.updateShaders(activeShaders, dataFlow: dataFlowConfig, in: nsView, force2DCompile: force2D || debugChanged)
             coord.cacheShaderState(shaders: activeShaders, dataFlow: dataFlowConfig)
         }
 

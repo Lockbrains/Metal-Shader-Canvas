@@ -250,7 +250,7 @@ struct HubView: View {
     private func openFilePicker() {
         let panel = NSOpenPanel()
         panel.title = String(localized: "Open Canvas")
-        panel.allowedContentTypes = [.shaderCanvas]
+        panel.allowedContentTypes = [.shaderCanvas, .shaderLab]
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
 

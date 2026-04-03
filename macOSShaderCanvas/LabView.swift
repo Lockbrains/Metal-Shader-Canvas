@@ -99,6 +99,7 @@ struct LabView: View {
     @State private var leftPanelTab: LeftPanelTab = .references
     @State private var rightPanelTab: RightPanelTab = .chat
     @State private var centerPanelTab: CenterPanelTab = .shader
+    @State private var splitRightTab: CenterPanelTab = .designDoc
     @State private var isLeftPanelVisible = true
     @State private var isRightPanelVisible = true
     @State private var isShaderEditorVisible = false
@@ -122,6 +123,7 @@ struct LabView: View {
 
     enum CenterPanelTab: String, CaseIterable {
         case shader = "Shader"
+        case codeEditor = "Code Editor"
         case designDoc = "Design Doc"
         case projectDoc = "Project Doc"
     }
@@ -360,51 +362,106 @@ struct LabView: View {
     }
 
     private var centerTabBar: some View {
-        HStack(spacing: 2) {
-            ForEach(CenterPanelTab.allCases, id: \.self) { tab in
-                Button(action: { withAnimation(.easeInOut(duration: 0.15)) { centerPanelTab = tab } }) {
-                    HStack(spacing: 4) {
-                        Image(systemName: centerTabIcon(tab))
-                            .font(.system(size: 9))
-                        Text(tab.rawValue)
-                            .font(.system(size: 10, weight: .medium))
+        VStack(spacing: 0) {
+            HStack(spacing: 2) {
+                if isCenterSplit {
+                    Image(systemName: "l.square")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundColor(.white.opacity(0.25))
+                        .padding(.trailing, 2)
+                }
+                ForEach(CenterPanelTab.allCases, id: \.self) { tab in
+                    Button(action: { withAnimation(.easeInOut(duration: 0.15)) { centerPanelTab = tab } }) {
+                        HStack(spacing: 4) {
+                            Image(systemName: centerTabIcon(tab))
+                                .font(.system(size: 9))
+                            Text(tab.rawValue)
+                                .font(.system(size: 10, weight: .medium))
+                        }
+                        .foregroundColor(centerPanelTab == tab ? .white : .white.opacity(0.4))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(centerPanelTab == tab ? Color.white.opacity(0.1) : Color.clear)
+                        .cornerRadius(5)
                     }
-                    .foregroundColor(centerPanelTab == tab ? .white : .white.opacity(0.4))
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                    .background(centerPanelTab == tab ? Color.white.opacity(0.1) : Color.clear)
-                    .cornerRadius(5)
+                    .buttonStyle(.plain)
+                }
+
+                Spacer()
+
+                Button(action: { withAnimation(.easeInOut(duration: 0.2)) { isCenterSplit.toggle() } }) {
+                    Image(systemName: isCenterSplit ? "rectangle" : "rectangle.split.2x1")
+                        .font(.system(size: 11))
+                        .foregroundColor(isCenterSplit ? .cyan : .white.opacity(0.4))
                 }
                 .buttonStyle(.plain)
+                .help(isCenterSplit ? "Exit split view" : "Split view")
             }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
 
-            Spacer()
-
-            Button(action: { withAnimation(.easeInOut(duration: 0.2)) { isCenterSplit.toggle() } }) {
-                Image(systemName: isCenterSplit ? "rectangle" : "rectangle.split.2x1")
-                    .font(.system(size: 11))
-                    .foregroundColor(isCenterSplit ? .cyan : .white.opacity(0.4))
+            if isCenterSplit {
+                Divider().background(Color.white.opacity(0.05))
+                HStack(spacing: 2) {
+                    Image(systemName: "r.square")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundColor(.white.opacity(0.25))
+                        .padding(.trailing, 2)
+                    ForEach(CenterPanelTab.allCases, id: \.self) { tab in
+                        Button(action: { withAnimation(.easeInOut(duration: 0.15)) { splitRightTab = tab } }) {
+                            HStack(spacing: 4) {
+                                Image(systemName: centerTabIcon(tab))
+                                    .font(.system(size: 9))
+                                Text(tab.rawValue)
+                                    .font(.system(size: 10, weight: .medium))
+                            }
+                            .foregroundColor(splitRightTab == tab ? .white : .white.opacity(0.4))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(splitRightTab == tab ? Color.white.opacity(0.1) : Color.clear)
+                            .cornerRadius(5)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    Spacer()
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
             }
-            .buttonStyle(.plain)
-            .help(isCenterSplit ? "Exit split view" : "Split: Shader + Document")
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 5)
     }
 
     private func centerTabIcon(_ tab: CenterPanelTab) -> String {
         switch tab {
         case .shader:     return "cube.transparent"
+        case .codeEditor: return "chevron.left.forwardslash.chevron.right"
         case .designDoc:  return "doc.text"
         case .projectDoc: return "doc.richtext"
         }
     }
 
     @ViewBuilder
-    private var singleCenterContent: some View {
-        switch centerPanelTab {
+    private func panelContent(for tab: CenterPanelTab) -> some View {
+        switch tab {
         case .shader:
             shaderPreviewPanel
+        case .codeEditor:
+            MSLCodeEditorView(
+                canvasMode: canvasMode,
+                objects2D: objects2D,
+                activeShaders: activeShaders,
+                sharedVertexCode2D: sharedVertexCode2D,
+                sharedFragmentCode2D: sharedFragmentCode2D,
+                dataFlowConfig: dataFlowConfig,
+                dataFlow2DConfig: dataFlow2DConfig,
+                meshType: meshType,
+                paramValues: paramValues,
+                backgroundImage: backgroundImage,
+                rotationAngle: Float(rotationAngle),
+                canvasZoom: canvasZoom,
+                canvasPan: canvasPan,
+                shape2DType: shape2DType
+            )
         case .designDoc:
             MarkdownDocumentView(
                 markdown: $designDoc.markdown,
@@ -422,30 +479,17 @@ struct LabView: View {
         }
     }
 
+    @ViewBuilder
+    private var singleCenterContent: some View {
+        panelContent(for: centerPanelTab)
+    }
+
     private var splitCenterContent: some View {
         HSplitView {
-            shaderPreviewPanel
+            panelContent(for: centerPanelTab)
                 .frame(minWidth: 200)
-
-            Group {
-                switch centerPanelTab {
-                case .shader, .designDoc:
-                    MarkdownDocumentView(
-                        markdown: $designDoc.markdown,
-                        lastModified: $designDoc.lastModified,
-                        title: "Design Document",
-                        accentColor: .cyan
-                    )
-                case .projectDoc:
-                    MarkdownDocumentView(
-                        markdown: $projectDocument.markdown,
-                        lastModified: $projectDocument.lastModified,
-                        title: "Project Document",
-                        accentColor: .mint
-                    )
-                }
-            }
-            .frame(minWidth: 200)
+            panelContent(for: splitRightTab)
+                .frame(minWidth: 200)
         }
     }
 
@@ -588,6 +632,21 @@ struct LabView: View {
                     .foregroundColor(.white.opacity(0.4))
             }
             .buttonStyle(.plain)
+            Button(action: {
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    if editingShaderID == shader.id {
+                        editingShaderID = nil
+                        isShaderEditorVisible = false
+                    }
+                    activeShaders.removeAll { $0.id == shader.id }
+                }
+            }) {
+                Image(systemName: "trash")
+                    .font(.system(size: 9))
+                    .foregroundColor(.white.opacity(0.25))
+            }
+            .buttonStyle(.plain)
+            .help("Delete \(shader.name)")
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
@@ -605,6 +664,18 @@ struct LabView: View {
                 .foregroundColor(.white.opacity(0.8))
                 .lineLimit(1)
             Spacer()
+            Button(action: {
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    if selectedObjectID == obj.id { selectedObjectID = nil }
+                    objects2D.removeAll { $0.id == obj.id }
+                }
+            }) {
+                Image(systemName: "trash")
+                    .font(.system(size: 9))
+                    .foregroundColor(.white.opacity(0.25))
+            }
+            .buttonStyle(.plain)
+            .help("Delete \(obj.name)")
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
@@ -760,10 +831,11 @@ struct LabView: View {
     private func performSaveAs() {
         let panel = NSSavePanel()
         panel.title = "Save Lab Project"
-        panel.nameFieldStringValue = canvasName + ".shadercanvas"
-        panel.allowedContentTypes = [.shaderCanvas]
+        panel.nameFieldStringValue = canvasName + ".shaderlab"
+        panel.allowedContentTypes = [.shaderLab, .shaderCanvas]
         panel.canCreateDirectories = true
         if panel.runModal() == .OK, let url = panel.url {
+            canvasName = url.deletingPathExtension().lastPathComponent
             saveCanvas(to: url)
         }
     }
@@ -772,6 +844,8 @@ struct LabView: View {
         var session = labSession
         session.parameterSnapshots = parameterSnapshots
         session.adversarialProposals = adversarialProposals
+        session.chatMessages = chatStore.messages
+        session.lastModified = Date()
         let doc = CanvasActions.buildDocument(
             name: canvasName, mode: canvasMode, meshType: meshType,
             shape2DType: shape2DType, shaders: activeShaders,
@@ -824,6 +898,7 @@ struct LabView: View {
                 labSession = session
                 parameterSnapshots = session.parameterSnapshots
                 adversarialProposals = session.adversarialProposals
+                chatStore.messages = session.chatMessages
             }
             if let refs = doc.references { references = refs }
             if let projDoc = doc.projectDocument {

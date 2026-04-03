@@ -137,11 +137,11 @@ class AISettings {
 ///
 /// Each message has a role (user/assistant/system), content text,
 /// and a timestamp. The UUID enables SwiftUI list identification.
-nonisolated struct ChatMessage: Identifiable, Sendable {
-    let id = UUID()
+nonisolated struct ChatMessage: Identifiable, Codable, Sendable {
+    let id: UUID
     let role: MessageRole
     var content: String
-    let timestamp = Date()
+    let timestamp: Date
     var executedActions: [AgentAction]? = nil
     var executedLabActions: [LabAction]? = nil
     var barriers: [String]? = nil
@@ -150,7 +150,57 @@ nonisolated struct ChatMessage: Identifiable, Sendable {
     var renderSnapshot: Data? = nil
     var userImage: Data? = nil
 
-    nonisolated enum MessageRole: String, Sendable { case user, assistant, system }
+    nonisolated enum MessageRole: String, Codable, Sendable { case user, assistant, system }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, role, content, timestamp
+        case executedActions, executedLabActions, barriers, thinking, plan
+    }
+
+    init(role: MessageRole, content: String, executedActions: [AgentAction]? = nil,
+         executedLabActions: [LabAction]? = nil, barriers: [String]? = nil,
+         thinking: String? = nil, plan: AgentPlan? = nil,
+         renderSnapshot: Data? = nil, userImage: Data? = nil) {
+        self.id = UUID()
+        self.role = role
+        self.content = content
+        self.timestamp = Date()
+        self.executedActions = executedActions
+        self.executedLabActions = executedLabActions
+        self.barriers = barriers
+        self.thinking = thinking
+        self.plan = plan
+        self.renderSnapshot = renderSnapshot
+        self.userImage = userImage
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        role = try container.decode(MessageRole.self, forKey: .role)
+        content = try container.decode(String.self, forKey: .content)
+        timestamp = try container.decodeIfPresent(Date.self, forKey: .timestamp) ?? Date()
+        executedActions = try container.decodeIfPresent([AgentAction].self, forKey: .executedActions)
+        executedLabActions = try container.decodeIfPresent([LabAction].self, forKey: .executedLabActions)
+        barriers = try container.decodeIfPresent([String].self, forKey: .barriers)
+        thinking = try container.decodeIfPresent(String.self, forKey: .thinking)
+        plan = try container.decodeIfPresent(AgentPlan.self, forKey: .plan)
+        renderSnapshot = nil
+        userImage = nil
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(role, forKey: .role)
+        try container.encode(content, forKey: .content)
+        try container.encode(timestamp, forKey: .timestamp)
+        try container.encodeIfPresent(executedActions, forKey: .executedActions)
+        try container.encodeIfPresent(executedLabActions, forKey: .executedLabActions)
+        try container.encodeIfPresent(barriers, forKey: .barriers)
+        try container.encodeIfPresent(thinking, forKey: .thinking)
+        try container.encodeIfPresent(plan, forKey: .plan)
+    }
 }
 
 // MARK: - AI Settings View

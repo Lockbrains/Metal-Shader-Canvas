@@ -100,6 +100,14 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     /// Set automatically on init; only one MetalRenderer exists at a time.
     static weak var current: MetalRenderer?
 
+    /// When true, this renderer is used for debug preview and won't set `current`.
+    let isDebugRenderer: Bool
+
+    /// Per-object debug fragment source overrides. Key is object/shader UUID.
+    /// When set, the compile pipeline uses this source instead of the normal fragment.
+    /// For 3D mesh, use the sentinel UUID 00000000-0000-0000-0000-000000000001.
+    var debugFragmentOverrides: [UUID: String] = [:]
+
     // MARK: - Core Metal Objects
 
     /// The GPU device handle. All Metal resources are created through this object.
@@ -277,10 +285,13 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     ///
     /// Returns nil if any critical Metal resource cannot be created.
     ///
-    /// - Parameter metalView: An MTKView with its `device` property already set.
-    init?(metalView: MTKView) {
+    /// - Parameters:
+    ///   - metalView: An MTKView with its `device` property already set.
+    ///   - isDebugRenderer: When true, skips setting `MetalRenderer.current`.
+    init?(metalView: MTKView, isDebugRenderer: Bool = false) {
         guard let device = metalView.device else { return nil }
         self.device = device
+        self.isDebugRenderer = isDebugRenderer
         super.init()
 
         // Register as the MTKView's delegate to receive draw callbacks.
@@ -312,7 +323,9 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         compileBgBlitPipeline()
         compileGridPipeline()
 
-        MetalRenderer.current = self
+        if !isDebugRenderer {
+            MetalRenderer.current = self
+        }
     }
 
     // MARK: - Mesh Setup
@@ -518,7 +531,13 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         let vBody = ShaderSnippets.injectParamsBuffer(into: vRawBody, paramCount: allParams.count)
         let fBody = ShaderSnippets.injectParamsBuffer(into: fRawBody, paramCount: allParams.count)
         let vSource = header + paramHeader + vBody
-        let fSource = header + paramHeader + fBody
+        let meshDebugSentinel = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
+        let fSource: String
+        if let debugFS = debugFragmentOverrides[meshDebugSentinel] {
+            fSource = debugFS
+        } else {
+            fSource = header + paramHeader + fBody
+        }
         let capturedParams = allParams
 
         let postResult: (String?) -> Void = { [weak self] error in
@@ -855,10 +874,15 @@ class MetalRenderer: NSObject, MTKViewDelegate {
                 let vsWrapper = ShaderSnippets.generate2DVertexWrapper(shape: shape, config: dfConfig, hasParams: totalParamCount > 0)
                 let vsSource = header + paramHeader + vsInjected + vsWrapper
 
-                let fsStripped = ShaderSnippets.stripStructDefinitions(from: fsUserCode)
-                let sdfAccess = object.shapeLocked && object.customFragmentCode != nil
-                let fsWrapped = ShaderSnippets.wrapFragmentWithSDF(userCode: fsStripped, shape: shape, hasParams: totalParamCount > 0, sdfAccessEnabled: sdfAccess)
-                let fsSource = header + paramHeader + fsWrapped
+                let fsSource: String
+                if let debugFS = self?.debugFragmentOverrides[object.id] {
+                    fsSource = debugFS
+                } else {
+                    let fsStripped = ShaderSnippets.stripStructDefinitions(from: fsUserCode)
+                    let sdfAccess = object.shapeLocked && object.customFragmentCode != nil
+                    let fsWrapped = ShaderSnippets.wrapFragmentWithSDF(userCode: fsStripped, shape: shape, hasParams: totalParamCount > 0, sdfAccessEnabled: sdfAccess)
+                    fsSource = header + paramHeader + fsWrapped
+                }
 
                 do {
                     let pipeline = try Self.compileObject2DPipelineWithRetry(
@@ -1149,7 +1173,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
                     encoder.setVertexBytes(&transform, length: MemoryLayout<Transform2D>.stride, index: 3)
 
                     if let cachedParams = object2DParams[object.id], !cachedParams.isEmpty {
-                        var paramBuffer = ShaderSnippets.packParamBuffer(params: cachedParams, values: paramValues)
+                        var paramBuffer = ShaderSnippets.packParamBuffer(params: cachedParams, values: paramValues, scopeKey: object.id.uuidString)
                         let bufLen = paramBuffer.count * MemoryLayout<Float>.stride
                         encoder.setVertexBytes(&paramBuffer, length: bufLen, index: 2)
                         encoder.setFragmentBytes(&paramBuffer, length: bufLen, index: 2)
@@ -1431,7 +1455,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
             enc.setVertexBytes(&transform, length: MemoryLayout<Transform2D>.stride, index: 3)
 
             if let cachedParams = object2DParams[objectID], !cachedParams.isEmpty {
-                var buf = ShaderSnippets.packParamBuffer(params: cachedParams, values: paramValues)
+                var buf = ShaderSnippets.packParamBuffer(params: cachedParams, values: paramValues, scopeKey: objectID.uuidString)
                 let len = buf.count * MemoryLayout<Float>.stride
                 enc.setVertexBytes(&buf, length: len, index: 2)
                 enc.setFragmentBytes(&buf, length: len, index: 2)

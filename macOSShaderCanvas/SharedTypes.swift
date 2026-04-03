@@ -27,6 +27,11 @@ extension UTType {
     /// Declared as an exported type in Info.plist (com.linghent.shadercanvas).
     /// This enables Finder integration and document-based file associations.
     static let shaderCanvas = UTType(exportedAs: "com.linghent.shadercanvas")
+
+    /// Lab mode project files (.shaderlab).
+    /// Same underlying JSON structure as .shadercanvas but includes
+    /// full chat history, references, and design documents.
+    static let shaderLab = UTType(exportedAs: "com.linghent.shaderlab")
 }
 
 // MARK: - Canvas Mode

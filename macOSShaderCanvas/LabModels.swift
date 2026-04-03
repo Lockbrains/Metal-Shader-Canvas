@@ -429,17 +429,31 @@ struct LabSession: Codable {
     var visitedPhases: Set<String>
     var createdDate: Date
     var lastModified: Date
+    var chatMessages: [ChatMessage]
 
     init(currentPhase: LabPhase = .referenceInput,
          parameterSnapshots: [ParameterSnapshot] = [],
          adversarialProposals: [AdversarialProposal] = [],
-         visitedPhases: Set<String> = [LabPhase.referenceInput.rawValue]) {
+         visitedPhases: Set<String> = [LabPhase.referenceInput.rawValue],
+         chatMessages: [ChatMessage] = []) {
         self.currentPhase = currentPhase
         self.parameterSnapshots = parameterSnapshots
         self.adversarialProposals = adversarialProposals
         self.visitedPhases = visitedPhases
         self.createdDate = Date()
         self.lastModified = Date()
+        self.chatMessages = chatMessages
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        currentPhase = try container.decode(LabPhase.self, forKey: .currentPhase)
+        parameterSnapshots = try container.decodeIfPresent([ParameterSnapshot].self, forKey: .parameterSnapshots) ?? []
+        adversarialProposals = try container.decodeIfPresent([AdversarialProposal].self, forKey: .adversarialProposals) ?? []
+        visitedPhases = try container.decodeIfPresent(Set<String>.self, forKey: .visitedPhases) ?? []
+        createdDate = try container.decodeIfPresent(Date.self, forKey: .createdDate) ?? Date()
+        lastModified = try container.decodeIfPresent(Date.self, forKey: .lastModified) ?? Date()
+        chatMessages = try container.decodeIfPresent([ChatMessage].self, forKey: .chatMessages) ?? []
     }
 
     mutating func advanceTo(_ phase: LabPhase) {

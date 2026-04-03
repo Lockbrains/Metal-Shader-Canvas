@@ -607,8 +607,14 @@ actor AIService {
         - Write ONLY the fragment_main function.
         - Base signature: fragment float4 fragment_main(VertexOut in [[stage_in]], constant Uniforms &uniforms [[buffer(1)]])
         - SDF edge clipping is applied automatically — just output the color.
-        - Available VertexOut fields: in.texCoord (float2, shape-local UV [0,1])
+        - Available VertexOut fields:
+          • in.texCoord (float2) — shape-local UV [0,1]
+          • in.shapeAspect (float) — combined screen-space aspect ratio of the object (accounts for shape preset, object scale, AND viewport aspect)
+          • in.cornerRadius (float) — corner radius for rounded shapes
         - Available uniforms: .resolution (float2), .time (float), .mouseX/.mouseY (float)
+        - ⚠️ ASPECT RATIO: When writing SDF or any geometry that needs correct proportions,
+          use in.shapeAspect to correct coordinates: float2 p = (in.texCoord - 0.5) * float2(in.shapeAspect, 1.0);
+          Do NOT use "in.texCoord * 2.0 - 1.0" alone — it ignores aspect ratio and stretches shapes.
 
         SDF ACCESS (shape-locked objects only):
         When an object's shape is locked (see context: "[SHAPE LOCKED — SDF access enabled]"),
