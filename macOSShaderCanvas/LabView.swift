@@ -105,6 +105,7 @@ struct LabView: View {
     @State private var isShaderEditorVisible = false
     @State private var isCenterSplit = false
     @State private var showingPhaseMenu = false
+    @State private var isFinalizing = false
 
     // MARK: - Documents
 
@@ -244,6 +245,8 @@ struct LabView: View {
             phaseMenuButton
 
             Spacer()
+
+            finalizeButton
 
             HStack(spacing: 8) {
                 Button(action: { withAnimation { isLeftPanelVisible.toggle() } }) {
@@ -729,6 +732,72 @@ struct LabView: View {
                 .background(Color.black.opacity(0.3))
         }
         .background(Color(nsColor: NSColor(red: 0.12, green: 0.12, blue: 0.14, alpha: 1.0)))
+    }
+
+    // MARK: - Finalize
+
+    private var finalizeButton: some View {
+        Button(action: { performFinalize() }) {
+            HStack(spacing: 5) {
+                if isFinalizing {
+                    ProgressView()
+                        .scaleEffect(0.5)
+                        .frame(width: 12, height: 12)
+                } else {
+                    Image(systemName: "checkmark.seal.fill")
+                        .font(.system(size: 11))
+                }
+                Text("Finalize")
+                    .font(.system(size: 11, weight: .medium))
+            }
+            .foregroundColor(isFinalizing ? .white.opacity(0.4) : .mint)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(Color.mint.opacity(isFinalizing ? 0.05 : 0.12))
+            .cornerRadius(6)
+        }
+        .buttonStyle(.plain)
+        .disabled(isFinalizing || !aiSettings.isConfigured)
+        .help("Generate structured Project Document from current shader state")
+    }
+
+    private func performFinalize() {
+        guard !isFinalizing else { return }
+        isFinalizing = true
+
+        Task {
+            let capture = await Task.detached { MetalRenderer.current?.captureForAI() }.value
+            let captured = aiSettings.captured
+
+            do {
+                let markdown = try await LabAIFlow.finalizeProject(
+                    designDoc: designDoc,
+                    activeShaders: activeShaders,
+                    canvasMode: canvasMode,
+                    objects2D: objects2D,
+                    sharedVertexCode2D: sharedVertexCode2D,
+                    sharedFragmentCode2D: sharedFragmentCode2D,
+                    paramValues: paramValues,
+                    captured: captured,
+                    renderCapture: capture
+                )
+                await MainActor.run {
+                    projectDocument.markdown = markdown
+                    projectDocument.lastModified = Date()
+                    hasUnsavedChanges = true
+
+                    withAnimation(.easeInOut(duration: 0.25)) {
+                        centerPanelTab = .projectDoc
+                    }
+                    isFinalizing = false
+                }
+            } catch {
+                await MainActor.run {
+                    print("[Lab] Finalize error: \(error)")
+                    isFinalizing = false
+                }
+            }
+        }
     }
 
     // MARK: - Canvas Actions

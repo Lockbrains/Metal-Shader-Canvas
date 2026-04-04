@@ -1383,8 +1383,16 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     /// Thread-safe: uses CGContext instead of NSImage.lockFocus (which requires
     /// the main thread and deadlocks when called from Task.detached).
     func captureForAI(maxDimension: Int = 512) -> Data? {
-        guard let nsImage = captureSnapshot() else { return nil }
-        return Self.resizeAndCompress(nsImage, maxDimension: maxDimension)
+        guard let nsImage = captureSnapshot() else {
+            print("[CAPTURE-AI] captureSnapshot returned nil")
+            return nil
+        }
+        guard let data = Self.resizeAndCompress(nsImage, maxDimension: maxDimension) else {
+            print("[CAPTURE-AI] resizeAndCompress returned nil")
+            return nil
+        }
+        print("[CAPTURE-AI] OK — \(data.count) bytes")
+        return data
     }
 
     /// Renders a single 2D object in isolation and returns a JPEG snapshot.
@@ -1540,31 +1548,41 @@ class MetalRenderer: NSObject, MTKViewDelegate {
 
     /// Captures the current offscreen texture A as an NSImage (for Hub thumbnails).
     func captureSnapshot() -> NSImage? {
-        guard let texture = offscreenTextureA else { return nil }
+        guard let texture = offscreenTextureA else {
+            print("[SNAPSHOT] offscreenTextureA is nil")
+            return nil
+        }
         let w = texture.width
         let h = texture.height
-        guard w > 0, h > 0 else { return nil }
+        guard w > 0, h > 0 else {
+            print("[SNAPSHOT] texture size invalid: \(w)x\(h)")
+            return nil
+        }
 
         let bytesPerRow = w * 4
         let region = MTLRegion(origin: .init(x: 0, y: 0, z: 0),
                                size: .init(width: w, height: h, depth: 1))
 
-        // Need a managed/shared copy to read from CPU. Private textures
-        // require a blit to a readable texture first.
         let desc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .bgra8Unorm, width: w, height: h, mipmapped: false)
         desc.storageMode = .managed
         desc.usage = .shaderRead
         guard let readable = device.makeTexture(descriptor: desc),
               let cmdBuf = commandQueue.makeCommandBuffer(),
-              let blit = cmdBuf.makeBlitCommandEncoder() else { return nil }
+              let blit = cmdBuf.makeBlitCommandEncoder() else {
+            print("[SNAPSHOT] failed to create Metal resources for readback")
+            return nil
+        }
         blit.copy(from: texture, to: readable)
         blit.synchronize(resource: readable)
         blit.endEncoding()
         cmdBuf.commit()
         let gpuDone = DispatchSemaphore(value: 0)
         cmdBuf.addCompletedHandler { _ in gpuDone.signal() }
-        if gpuDone.wait(timeout: .now() + .seconds(3)) == .timedOut { return nil }
+        if gpuDone.wait(timeout: .now() + .seconds(3)) == .timedOut {
+            print("[SNAPSHOT] GPU readback timed out (3 s)")
+            return nil
+        }
 
         var bytes = [UInt8](repeating: 0, count: bytesPerRow * h)
         readable.getBytes(&bytes, bytesPerRow: bytesPerRow, from: region, mipmapLevel: 0)
@@ -1576,7 +1594,10 @@ class MetalRenderer: NSObject, MTKViewDelegate {
                                     bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue),
                                     provider: provider, decode: nil, shouldInterpolate: false,
                                     intent: .defaultIntent)
-        else { return nil }
+        else {
+            print("[SNAPSHOT] CGImage construction failed")
+            return nil
+        }
 
         return NSImage(cgImage: cgImage, size: NSSize(width: w, height: h))
     }

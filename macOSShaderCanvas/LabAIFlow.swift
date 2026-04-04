@@ -59,10 +59,14 @@ enum LabAIFlow {
         // All phases use the same unified path — the AI decides what actions
         // to take (labActions for docs/params, agentActions for shader code).
         // No phase-gating: the AI can write shader code from any phase.
+        var userMessage = text
+        if canvasMode.is2D {
+            userMessage += Self.coordinateReminder
+        }
         print("[LAB-AI] BEFORE await sendLabChat  +\(Int((CFAbsoluteTimeGetCurrent()-t0)*1000))ms")
         let result = try await sendLabChat(
             system: systemPrompt,
-            userMessage: text,
+            userMessage: userMessage,
             chatHistory: chatHistory,
             captured: captured,
             imageData: imageData,
@@ -73,6 +77,18 @@ enum LabAIFlow {
     }
 
     // MARK: - Unified System Prompt
+
+    /// Appended to EVERY user message in 2D mode so the AI always sees the
+    /// coordinate convention right next to the user's request — LLMs tend to
+    /// "forget" system-level instructions after a few turns.
+    private static let coordinateReminder = """
+
+    [IMPORTANT — Metal Coordinate System]
+    This is Metal Shading Language. Metal's texCoord uses TOP-LEFT origin: texCoord.y = 0 at the TOP of the shape, texCoord.y = 1 at the BOTTOM. This is the OPPOSITE of GLSL / ShaderToy / standard math convention.
+    When writing SDF shapes, you MUST negate Y to convert to math convention (Y-up):
+      float2 p = (in.texCoord - 0.5) * float2(in.shapeAspect, -1.0);
+    The -1.0 on Y is critical. Without it, asymmetric shapes (hearts, arrows, drops) will appear upside-down.
+    """
 
     private static let baseRole = """
     You are an expert shader development collaborator in a Lab environment. \
@@ -127,6 +143,13 @@ enum LabAIFlow {
         - The // @param directives in shader code are what create real UI sliders. addParameter only pre-registers defaults. ALWAYS include // @param in your shader code for every user-adjustable value.
         - You can combine labActions and agentActions in the same response
         - ⚠️ ALWAYS write COMPLETE implementations: every addObject2D MUST have a matching setObjectShader2D with actual shader code in the SAME response. Objects without custom shaders render as plain default gradients and look broken. NEVER split object creation and shader writing across multiple turns.
+
+        ⚠️ MODIFY, DON'T REWRITE:
+        When the user asks to tweak, fix, or adjust an existing effect, look at the CURRENT shader code
+        shown in the workspace state and make TARGETED changes — preserve the overall structure, // @param
+        directives, existing variable names, and working logic. Only rewrite from scratch if the user
+        explicitly asks for a completely new approach. Use setObjectShader2D with the UPDATED code
+        (not a blank-slate rewrite) so incremental changes stay stable.
 
         AVAILABLE ACTIONS (labActions array):
         1. Update Design Doc (collaborative plan):
@@ -288,12 +311,18 @@ enum LabAIFlow {
             Correct pattern:  float2 p = (in.texCoord - 0.5) * float2(in.shapeAspect, 1.0);
             WRONG pattern:    float2 p = in.texCoord * 2.0 - 1.0;  // IGNORES aspect → shapes stretch!
 
+            ⚠️ Y-AXIS — Metal texCoord is TOP-LEFT origin (Y=0 top, Y=1 bottom):
+            After centering, positive p.y points DOWNWARD — opposite of GLSL/ShaderToy (Y-up).
+            You MUST negate Y when using SDF formulas from standard references:
+              float2 p = (in.texCoord - 0.5) * float2(in.shapeAspect, -1.0);
+            The -1.0 converts to Y-up math convention. Without it, hearts/arrows/drops render upside-down.
+
             Example — heart SDF inside a Circle object:
               fragment float4 fragment_main(VertexOut in [[stage_in]], constant Uniforms &uniforms [[buffer(1)]]) {
-                  float2 p = (in.texCoord - 0.5) * float2(in.shapeAspect, 1.0);
-                  // Heart SDF (Inigo Quilez) — works correctly at any viewport size
+                  float2 p = (in.texCoord - 0.5) * float2(in.shapeAspect, -1.0);
+                  // Heart SDF (Inigo Quilez) — -1.0 flips Y to match standard math convention
                   p.x = abs(p.x);
-                  float d = length(p - float2(0.25, -0.3)) < ... ;  // your SDF math
+                  float d = length(p - float2(0.25, 0.3)) - 0.5;  // your SDF math
                   float3 col = mix(float3(0.1), float3(1, 0.2, 0.3), smoothstep(0.01, -0.01, d));
                   return float4(col, 1.0);
               }
@@ -420,6 +449,12 @@ enum LabAIFlow {
                 if obj.shapeLocked { ctx += " [SHAPE LOCKED — SDF access enabled]" }
                 if obj.isAIPreview { ctx += " [AI preview]" }
                 ctx += "\n"
+                if let fragCode = obj.customFragmentCode, !fragCode.isEmpty {
+                    ctx += "  — Current Fragment Shader:\n\(fragCode)\n"
+                }
+                if let vertCode = obj.customVertexCode, !vertCode.isEmpty {
+                    ctx += "  — Current Vertex Shader:\n\(vertCode)\n"
+                }
             }
         }
 
@@ -519,6 +554,121 @@ enum LabAIFlow {
         )
         let dfDesc = buildDataFlowDescription(canvasMode: canvasMode, config3D: dataFlowConfig, config2D: dataFlow2DConfig)
         return buildUnifiedPrompt(context: context, canvasMode: canvasMode, dataFlowDescription: dfDesc, phaseHint: phase)
+    }
+
+    // MARK: - Finalize Project Documentation
+
+    /// Generates comprehensive, structured project documentation from the current
+    /// shader state. Designed to be self-contained enough for another developer
+    /// or AI agent to recreate the effect on a different platform.
+    static func finalizeProject(
+        designDoc: DesignDocument,
+        activeShaders: [ActiveShader],
+        canvasMode: CanvasMode,
+        objects2D: [Object2D],
+        sharedVertexCode2D: String,
+        sharedFragmentCode2D: String,
+        paramValues: [String: [Float]],
+        captured: CapturedAISettings,
+        renderCapture: Data? = nil
+    ) async throws -> String {
+        var shaderContext = ""
+        if canvasMode.is2D {
+            for obj in objects2D where !obj.isAIPreview {
+                shaderContext += "Object: \(obj.name) [\(obj.shapeType.rawValue)]"
+                shaderContext += " pos=(\(obj.posX),\(obj.posY)) scale=(\(obj.scaleW),\(obj.scaleH))\n"
+                if let code = obj.customFragmentCode {
+                    shaderContext += "Fragment shader:\n\(code)\n\n"
+                }
+                if let code = obj.customVertexCode {
+                    shaderContext += "Vertex shader:\n\(code)\n\n"
+                }
+            }
+            if !sharedVertexCode2D.isEmpty {
+                shaderContext += "Shared vertex (2D):\n\(sharedVertexCode2D)\n\n"
+            }
+            if !sharedFragmentCode2D.isEmpty {
+                shaderContext += "Shared fragment (2D):\n\(sharedFragmentCode2D)\n\n"
+            }
+        }
+        for shader in activeShaders {
+            shaderContext += "[\(shader.category.rawValue)] \(shader.name):\n\(shader.code)\n\n"
+        }
+
+        let paramContext = paramValues.sorted(by: { $0.key < $1.key })
+            .map { "\($0.key) = \($0.value.map { String(format: "%.3f", $0) }.joined(separator: ", "))" }
+            .joined(separator: "\n")
+
+        let system = """
+        You are a senior graphics engineer writing final technical documentation for a shader effect.
+        Write in clear, structured markdown. The document MUST be comprehensive enough that another
+        developer or AI agent can recreate the exact same visual effect on any platform (WebGL, GLSL,
+        HLSL, Unity ShaderLab, etc.) without seeing the original code.
+        Respond with ONLY the markdown document — no JSON wrapper, no code fences around the entire document.
+        Write the entire document in the SAME language as the Design Document (if provided).
+        """
+
+        let prompt = """
+        Generate the final Project Document for this shader effect.
+
+        DESIGN DOCUMENT (if available):
+        \(designDoc.markdown.isEmpty ? "(none)" : designDoc.markdown)
+
+        SHADER CODE:
+        \(shaderContext.isEmpty ? "(none)" : shaderContext)
+
+        PARAMETERS:
+        \(paramContext.isEmpty ? "(none)" : paramContext)
+
+        MODE: \(canvasMode.rawValue)
+
+        The document MUST include ALL of these sections:
+
+        # [Project Title]
+
+        ## Overview
+        Brief description of the visual effect and its inspiration.
+
+        ## Mathematical Foundation
+        The core SDF functions, distance fields, coordinate transforms, and mathematical
+        principles used. Include the actual formulas with explanation of each term.
+
+        ## Code Architecture
+        How the shader is structured: which objects/layers exist, what each does,
+        the rendering pipeline order, and how they compose together.
+
+        ## Shader Code (Annotated)
+        The complete shader code with inline comments explaining non-obvious logic.
+        Include the code in Metal Shading Language code blocks.
+
+        ## Parameters Reference
+        Table of all @param values: name, type, default, range, and what each controls visually.
+
+        ## Platform Porting Notes
+        - Metal-specific conventions (coordinate space, Y-axis, texture sampling)
+        - How to adapt to GLSL/WebGL/HLSL (specific differences to watch for)
+        - UV coordinate space: Metal texCoord.y=0 is TOP, =1 is BOTTOM (opposite of GLSL)
+        - Any platform-specific considerations
+
+        ## Art Direction Notes
+        Color palette, timing/animation feel, visual weight, and aesthetic goals.
+        What makes this effect look "right" vs. a naive implementation.
+        """
+
+        let msg = ChatMessage(role: .user, content: prompt)
+        return try await AIService.onBackground {
+            switch captured.provider {
+            case .openai:
+                return try await AIService.shared.callOpenAI(
+                    system: system, messages: [msg], captured: captured, imageData: renderCapture)
+            case .anthropic:
+                return try await AIService.shared.callAnthropic(
+                    system: system, messages: [msg], captured: captured, imageData: renderCapture)
+            case .gemini:
+                return try await AIService.shared.callGemini(
+                    system: system, messages: [msg], captured: captured, imageData: renderCapture)
+            }
+        }
     }
 
     // MARK: - Reference Analysis

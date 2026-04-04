@@ -46,9 +46,14 @@ enum CanvasActions {
             switch action.type {
             case .addLayer:
                 guard let category = action.shaderCategory else { continue }
-                let shader = ActiveShader(category: category, name: action.name, code: action.code)
-                activeShaders.append(shader)
-                if result.firstShaderID == nil { result.firstShaderID = shader.id }
+                if let existing = activeShaders.firstIndex(where: { $0.name == action.name && $0.category == category }) {
+                    activeShaders[existing].code = action.code
+                    if result.firstShaderID == nil { result.firstShaderID = activeShaders[existing].id }
+                } else {
+                    let shader = ActiveShader(category: category, name: action.name, code: action.code)
+                    activeShaders.append(shader)
+                    if result.firstShaderID == nil { result.firstShaderID = shader.id }
+                }
 
             case .modifyLayer:
                 if let targetName = action.targetLayerName,
@@ -61,18 +66,29 @@ enum CanvasActions {
                 }
 
             case .addObject2D:
-                let obj = Object2D(
-                    name: action.name,
-                    shapeType: action.shape2DType ?? .roundedRectangle,
-                    posX: action.posX ?? 0,
-                    posY: action.posY ?? 0,
-                    scaleW: action.scaleW ?? 0.5,
-                    scaleH: action.scaleH ?? 0.5,
-                    rotation: action.rotation ?? 0,
-                    cornerRadius: action.cornerRadius ?? 0.15
-                )
-                objects2D.append(obj)
-                if result.firstObjectID == nil { result.firstObjectID = obj.id }
+                if let existing = objects2D.firstIndex(where: { $0.name == action.name && !$0.isAIPreview }) {
+                    if let shape = action.shape2DType { objects2D[existing].shapeType = shape }
+                    if let x = action.posX { objects2D[existing].posX = x }
+                    if let y = action.posY { objects2D[existing].posY = y }
+                    if let w = action.scaleW { objects2D[existing].scaleW = w }
+                    if let h = action.scaleH { objects2D[existing].scaleH = h }
+                    if let r = action.rotation { objects2D[existing].rotation = r }
+                    if let cr = action.cornerRadius { objects2D[existing].cornerRadius = cr }
+                    if result.firstObjectID == nil { result.firstObjectID = objects2D[existing].id }
+                } else {
+                    let obj = Object2D(
+                        name: action.name,
+                        shapeType: action.shape2DType ?? .roundedRectangle,
+                        posX: action.posX ?? 0,
+                        posY: action.posY ?? 0,
+                        scaleW: action.scaleW ?? 0.5,
+                        scaleH: action.scaleH ?? 0.5,
+                        rotation: action.rotation ?? 0,
+                        cornerRadius: action.cornerRadius ?? 0.15
+                    )
+                    objects2D.append(obj)
+                    if result.firstObjectID == nil { result.firstObjectID = obj.id }
+                }
 
             case .modifyObject2D:
                 let targetName = action.targetObjectName ?? action.name

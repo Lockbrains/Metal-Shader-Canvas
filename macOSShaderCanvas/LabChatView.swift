@@ -36,6 +36,8 @@ struct LabChatView: View {
     @State private var errorMessage: String?
     @State private var streamingText = ""
     @State private var pendingUserImage: Data?
+    @State private var isCapturing = false
+    @State private var captureFailed = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -116,6 +118,18 @@ struct LabChatView: View {
 
                 MarkdownTextView(message.content, fontSize: 12, color: .white.opacity(0.85))
                     .equatable()
+
+                if let snapshotData = message.renderSnapshot, let nsImage = NSImage(data: snapshotData) {
+                    Image(nsImage: nsImage)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(maxWidth: 200, maxHeight: 150)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6)
+                                .stroke(Color.white.opacity(0.1))
+                        )
+                }
 
                 if let actions = message.executedActions, !actions.isEmpty {
                     agentActionsSummary(actions)
@@ -264,11 +278,18 @@ struct LabChatView: View {
                 .help("Attach reference from board")
 
                 Button(action: captureRender) {
-                    Image(systemName: "camera.viewfinder")
-                        .font(.system(size: 14))
-                        .foregroundColor(.white.opacity(0.4))
+                    if isCapturing {
+                        ProgressView()
+                            .scaleEffect(0.5)
+                            .frame(width: 14, height: 14)
+                    } else {
+                        Image(systemName: "camera.viewfinder")
+                            .font(.system(size: 14))
+                            .foregroundColor(captureFailed ? .red.opacity(0.6) : .white.opacity(0.4))
+                    }
                 }
                 .buttonStyle(.plain)
+                .disabled(isCapturing)
                 .help("Capture current render")
 
                 TextField(inputPlaceholder, text: $inputText)
@@ -337,7 +358,7 @@ struct LabChatView: View {
         chatStore.messages.append(userMsg)
 
         let refs = references
-        let imageData = pendingUserImage
+        let imageData = pendingUserImage ?? latestRenderSnapshot() ?? MetalRenderer.current?.captureForAI()
         pendingUserImage = nil
 
         let captured = aiSettings.captured
@@ -387,6 +408,7 @@ struct LabChatView: View {
 
                     if let agentActions = response.agentActions, !agentActions.isEmpty {
                         assistantMsg.executedActions = agentActions
+                        self.beginPostActionCapture()
                         onAgentActions(agentActions)
                     }
                     if !response.labActions.isEmpty {
@@ -497,9 +519,81 @@ struct LabChatView: View {
     }
 
     private func captureRender() {
-        Task {
-            let capture = await Task.detached { await MetalRenderer.current?.captureForAI() }.value
-            if let data = capture { pendingUserImage = data }
+        guard !isCapturing else { return }
+        isCapturing = true
+        captureFailed = false
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(150))
+            let rendererExists = MetalRenderer.current != nil
+            print("[CAPTURE-BTN] MetalRenderer.current exists: \(rendererExists)")
+            let capture = await Task.detached { MetalRenderer.current?.captureForAI() }.value
+            isCapturing = false
+            if let data = capture {
+                pendingUserImage = data
+                print("[CAPTURE-BTN] Success — \(data.count) bytes")
+            } else {
+                captureFailed = true
+                print("[CAPTURE-BTN] Failed — captureForAI returned nil")
+                Task { @MainActor in
+                    try? await Task.sleep(for: .seconds(2))
+                    captureFailed = false
+                }
+            }
+        }
+    }
+
+    /// Sets up a notification-based capture that waits for shader compilation to
+    /// finish before snapshotting the render result. Must be called BEFORE
+    /// `onAgentActions` so the observer is registered before compilation begins.
+    private func beginPostActionCapture() {
+        let once = CaptureOnceGuard()
+        let store = chatStore
+        var observer: NSObjectProtocol?
+
+        let doCapture: @Sendable () -> Void = {
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(200))
+                let capture = await Task.detached { MetalRenderer.current?.captureForAI() }.value
+                guard let data = capture else {
+                    print("[CAPTURE] Post-action snapshot failed — captureForAI returned nil")
+                    return
+                }
+                if let lastIdx = store.messages.indices.last,
+                   store.messages[lastIdx].role == .assistant {
+                    store.messages[lastIdx].renderSnapshot = data
+                    print("[CAPTURE] Post-action snapshot attached (\(data.count) bytes)")
+                }
+            }
+        }
+
+        observer = NotificationCenter.default.addObserver(
+            forName: .shaderCompilationResult, object: nil, queue: .main
+        ) { _ in
+            guard once.tryOnce() else { return }
+            if let obs = observer { NotificationCenter.default.removeObserver(obs) }
+            print("[CAPTURE] Compilation finished — scheduling snapshot")
+            doCapture()
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) {
+            guard once.tryOnce() else { return }
+            if let obs = observer { NotificationCenter.default.removeObserver(obs) }
+            print("[CAPTURE] Compilation wait timed out (5 s) — capturing anyway")
+            doCapture()
+        }
+    }
+
+    /// Returns the most recent render snapshot from the conversation for AI context.
+    private func latestRenderSnapshot() -> Data? {
+        chatStore.messages.last(where: { $0.renderSnapshot != nil })?.renderSnapshot
+    }
+
+    private final class CaptureOnceGuard: @unchecked Sendable {
+        private var done = false
+        func tryOnce() -> Bool {
+            guard !done else { return false }
+            done = true
+            return true
         }
     }
 

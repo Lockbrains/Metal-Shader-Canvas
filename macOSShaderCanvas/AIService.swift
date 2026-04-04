@@ -615,6 +615,9 @@ actor AIService {
         - ⚠️ ASPECT RATIO: When writing SDF or any geometry that needs correct proportions,
           use in.shapeAspect to correct coordinates: float2 p = (in.texCoord - 0.5) * float2(in.shapeAspect, 1.0);
           Do NOT use "in.texCoord * 2.0 - 1.0" alone — it ignores aspect ratio and stretches shapes.
+        - ⚠️ Y-AXIS: Metal texCoord is top-left origin (Y=0 top, Y=1 bottom), opposite of GLSL/ShaderToy.
+          You MUST negate Y for SDF: float2 p = (in.texCoord - 0.5) * float2(in.shapeAspect, -1.0);
+          The -1.0 converts to math Y-up convention. Without it, asymmetric shapes render upside-down.
 
         SDF ACCESS (shape-locked objects only):
         When an object's shape is locked (see context: "[SHAPE LOCKED — SDF access enabled]"),
