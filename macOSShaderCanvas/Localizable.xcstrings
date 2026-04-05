@@ -4,6 +4,9 @@
     "" : {
 
     },
+    " · " : {
+
+    },
     "(%@)" : {
 
     },
@@ -174,12 +177,6 @@
 
     },
     "AI will challenge your shader with alternatives" : {
-
-    },
-    "AI-collaborative 2D shader development" : {
-
-    },
-    "AI-collaborative 3D shader development" : {
 
     },
     "Anthropic" : {
@@ -448,6 +445,7 @@
       }
     },
     "Fragment shaders on a fullscreen quad" : {
+      "extractionState" : "stale",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -625,6 +623,7 @@
       }
     },
     "New Project" : {
+      "extractionState" : "stale",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -688,7 +687,11 @@
     "No proposals yet" : {
 
     },
+    "No recent projects" : {
+
+    },
     "No Recent Projects" : {
+      "extractionState" : "stale",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -741,6 +744,9 @@
           }
         }
       }
+    },
+    "Open…" : {
+
     },
     "OpenAI" : {
 
@@ -835,6 +841,7 @@
 
     },
     "Recent Projects" : {
+      "extractionState" : "stale",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -1152,6 +1159,7 @@
 
     },
     "Vertex & fragment shaders on 3D meshes" : {
+      "extractionState" : "stale",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
