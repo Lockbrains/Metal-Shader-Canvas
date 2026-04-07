@@ -30,6 +30,8 @@ struct LabChatView: View {
     let compilationError: String?
     let meshType: MeshType
     let onAgentActions: ([AgentAction]) -> Void
+    let onCaptureCheckpoint: (UUID) -> Void
+    let onRevertToCheckpoint: (UUID) -> Void
 
     @State private var inputText = ""
     @State private var isLoading = false
@@ -99,6 +101,32 @@ struct LabChatView: View {
     }
 
     private func labMessageBubble(_ message: ChatMessage) -> some View {
+        Group {
+            if message.role == .system {
+                labSystemBubble(message)
+            } else {
+                labStandardBubble(message)
+            }
+        }
+    }
+
+    private func labSystemBubble(_ message: ChatMessage) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "arrow.uturn.backward.circle.fill")
+                .font(.system(size: 11))
+                .foregroundColor(.orange)
+            Text(message.content)
+                .font(.system(size: 10.5))
+                .foregroundColor(.orange.opacity(0.9))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(Color.orange.opacity(0.1))
+        .cornerRadius(8)
+        .frame(maxWidth: .infinity, alignment: .center)
+    }
+
+    private func labStandardBubble(_ message: ChatMessage) -> some View {
         HStack(alignment: .top, spacing: 8) {
             if message.role == .assistant {
                 Image(systemName: "sparkle")
@@ -137,6 +165,23 @@ struct LabChatView: View {
                 if let labActions = message.executedLabActions, !labActions.isEmpty {
                     labActionsSummary(labActions)
                 }
+
+                if labMessageHasActions(message) {
+                    Button(action: { revertToLabMessage(message.id) }) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.uturn.backward")
+                                .font(.system(size: 9))
+                            Text("回滚至此步骤前")
+                                .font(.system(size: 9.5, weight: .medium))
+                        }
+                        .foregroundColor(.orange.opacity(0.85))
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(Color.orange.opacity(0.1))
+                        .cornerRadius(5)
+                    }
+                    .buttonStyle(.plain)
+                }
             }
             .padding(10)
             .background(
@@ -154,6 +199,23 @@ struct LabChatView: View {
                     .padding(.top, 3)
             }
         }
+    }
+
+    private func labMessageHasActions(_ msg: ChatMessage) -> Bool {
+        if let actions = msg.executedActions, !actions.isEmpty { return true }
+        if let labActions = msg.executedLabActions, !labActions.isEmpty { return true }
+        return false
+    }
+
+    private func revertToLabMessage(_ messageID: UUID) {
+        onRevertToCheckpoint(messageID)
+        let preview = chatStore.messages
+            .first(where: { $0.id == messageID })
+            .map { String($0.content.prefix(40)) } ?? ""
+        chatStore.messages.append(ChatMessage(
+            role: .system,
+            content: "⏪ 已回滚画布至「\(preview)」之前的状态"
+        ))
     }
 
     private func agentActionsSummary(_ actions: [AgentAction]) -> some View {
@@ -404,14 +466,22 @@ struct LabChatView: View {
                 )
 
                 await MainActor.run {
-                    var assistantMsg = ChatMessage(role: .assistant, content: response.explanation)
+                    let msgID = UUID()
+                    let hasAgentActions = response.agentActions != nil && !response.agentActions!.isEmpty
+                    let hasLabActions = !response.labActions.isEmpty
+
+                    if hasAgentActions || hasLabActions {
+                        onCaptureCheckpoint(msgID)
+                    }
+
+                    var assistantMsg = ChatMessage(id: msgID, role: .assistant, content: response.explanation)
 
                     if let agentActions = response.agentActions, !agentActions.isEmpty {
                         assistantMsg.executedActions = agentActions
                         self.beginPostActionCapture()
                         onAgentActions(agentActions)
                     }
-                    if !response.labActions.isEmpty {
+                    if hasLabActions {
                         assistantMsg.executedLabActions = response.labActions
                         executeLabActions(response.labActions)
                     }

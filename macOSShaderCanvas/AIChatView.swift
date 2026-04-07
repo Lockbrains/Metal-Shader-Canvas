@@ -125,6 +125,8 @@ struct AIChatView: View {
     let selectedObjectID: UUID?
     let onGenerateTutorial: ([TutorialStep]) -> Void
     let onAgentActions: ([AgentAction]) -> Void
+    let onCaptureCheckpoint: (UUID) -> Void
+    let onRevertToCheckpoint: (UUID) -> Void
 
     @State private var inputText = ""
     @State private var isLoading = false
@@ -168,7 +170,10 @@ struct AIChatView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 12) {
                         ForEach(chatStore.messages) { msg in
-                            MessageBubble(message: msg).id(msg.id)
+                            MessageBubble(
+                                message: msg,
+                                onRevert: messageHasActions(msg) ? { revertToMessage(msg.id) } : nil
+                            ).id(msg.id)
                         }
                         // Streaming thinking display
                         if isLoading {
@@ -693,7 +698,9 @@ struct AIChatView: View {
 
                 await MainActor.run {
                     currentPlan = plan
-                    var planMsg = ChatMessage(role: .assistant, content: "Plan generated: \(plan.title)")
+                    let planMsgID = UUID()
+                    onCaptureCheckpoint(planMsgID)
+                    var planMsg = ChatMessage(id: planMsgID, role: .assistant, content: "Plan generated: \(plan.title)")
                     planMsg.plan = plan
                     chatStore.messages.append(planMsg)
                 }
@@ -1159,11 +1166,13 @@ struct AIChatView: View {
                     )
                 }
                 await MainActor.run {
+                    let msgID = UUID()
                     if !response.actions.isEmpty {
+                        onCaptureCheckpoint(msgID)
                         onAgentActions(response.actions)
                         pendingAutoFix = true
                     }
-                    var msg = ChatMessage(role: .assistant, content: response.explanation)
+                    var msg = ChatMessage(id: msgID, role: .assistant, content: response.explanation)
                     msg.executedActions = response.actions.isEmpty ? nil : response.actions
                     msg.barriers = response.canFulfill ? nil : response.barriers
                     msg.thinking = response.thinking
@@ -1230,6 +1239,25 @@ struct AIChatView: View {
         desc += "\nAvailable shapes: Rectangle, Rounded Rect, Circle, Capsule"
         return desc
     }
+
+    // MARK: - Agent Checkpoint Helpers
+
+    private func messageHasActions(_ msg: ChatMessage) -> Bool {
+        if let actions = msg.executedActions, !actions.isEmpty { return true }
+        if let plan = msg.plan, plan.nodes.contains(where: { $0.actions != nil && !($0.actions!.isEmpty) }) { return true }
+        return false
+    }
+
+    private func revertToMessage(_ messageID: UUID) {
+        onRevertToCheckpoint(messageID)
+        let preview = chatStore.messages
+            .first(where: { $0.id == messageID })
+            .map { String($0.content.prefix(40)) } ?? ""
+        chatStore.messages.append(ChatMessage(
+            role: .system,
+            content: "⏪ 已回滚画布至「\(preview)」之前的状态"
+        ))
+    }
 }
 
 // MARK: - Message Bubble
@@ -1242,7 +1270,37 @@ struct AIChatView: View {
 ///   - Shows technical barriers as orange warning blocks when the request can't be fulfilled
 struct MessageBubble: View {
     let message: ChatMessage
+    var onRevert: (() -> Void)? = nil
+
     var body: some View {
+        if message.role == .system {
+            systemBubble
+        } else {
+            standardBubble
+        }
+    }
+
+    // MARK: - System Message (rollback notification)
+
+    private var systemBubble: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "arrow.uturn.backward.circle.fill")
+                .font(.system(size: 12))
+                .foregroundColor(.orange)
+            Text(message.content)
+                .font(.system(size: 11.5))
+                .foregroundColor(.orange.opacity(0.9))
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(Color.orange.opacity(0.1))
+        .cornerRadius(8)
+        .frame(maxWidth: .infinity, alignment: .center)
+    }
+
+    // MARK: - Standard Message (user / assistant)
+
+    private var standardBubble: some View {
         HStack(alignment: .top, spacing: 8) {
             if message.role == .assistant {
                 Image(systemName: "sparkle").font(.system(size: 14)).foregroundColor(.purple).frame(width: 20)
@@ -1264,12 +1322,10 @@ struct MessageBubble: View {
                     .foregroundColor(.white.opacity(0.9))
                     .textSelection(.enabled).lineSpacing(3)
 
-                // Thinking section (collapsible)
                 if let thinking = message.thinking, !thinking.isEmpty {
                     ThinkingSection(text: thinking)
                 }
 
-                // Plan tree view
                 if let plan = message.plan {
                     AgentPlanView(plan: plan)
                 }
@@ -1311,6 +1367,23 @@ struct MessageBubble: View {
                     .padding(8)
                     .background(Color.orange.opacity(0.1))
                     .cornerRadius(6)
+                }
+
+                if let onRevert {
+                    Button(action: onRevert) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.uturn.backward")
+                                .font(.system(size: 10))
+                            Text("回滚至此步骤前")
+                                .font(.system(size: 10.5, weight: .medium))
+                        }
+                        .foregroundColor(.orange.opacity(0.85))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color.orange.opacity(0.1))
+                        .cornerRadius(6)
+                    }
+                    .buttonStyle(.plain)
                 }
             }
             .padding(.horizontal, 12).padding(.vertical, 8)

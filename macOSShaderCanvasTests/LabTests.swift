@@ -1310,4 +1310,139 @@ struct LabSessionTests {
         #expect(decoded.currentPhase == .implementation)
         #expect(decoded.visitedPhases.contains(LabPhase.implementation.rawValue))
     }
+
+    @Test func codableRoundTripWithChatMessages() throws {
+        var session = LabSession()
+        session.chatMessages = [
+            ChatMessage(role: .user, content: "Create a shader"),
+            ChatMessage(role: .assistant, content: "Here's a gradient shader",
+                        executedActions: [
+                            AgentAction(type: .addLayer, category: "fragment", name: "Gradient", code: "test")
+                        ]),
+            ChatMessage(role: .assistant, content: "Updated design doc",
+                        executedLabActions: [
+                            LabAction(type: .updateDesignDoc, content: "# Design")
+                        ])
+        ]
+        session.parameterSnapshots = [
+            ParameterSnapshot(paramValues: ["_speed": [1.5]], label: "Snapshot A")
+        ]
+        let data = try JSONEncoder().encode(session)
+        let decoded = try JSONDecoder().decode(LabSession.self, from: data)
+        #expect(decoded.chatMessages.count == 3)
+        #expect(decoded.chatMessages[0].role == .user)
+        #expect(decoded.chatMessages[0].content == "Create a shader")
+        #expect(decoded.chatMessages[1].executedActions?.count == 1)
+        #expect(decoded.chatMessages[2].executedLabActions?.count == 1)
+        #expect(decoded.parameterSnapshots.count == 1)
+    }
+}
+
+// MARK: - CanvasDocument Lab Round-Trip Tests
+
+struct CanvasDocumentLabTests {
+
+    @Test func roundTripLabWithAllFields() throws {
+        var session = LabSession()
+        session.advanceTo(.implementation)
+        session.chatMessages = [
+            ChatMessage(role: .user, content: "Hello"),
+            ChatMessage(role: .assistant, content: "World")
+        ]
+        let refs = [
+            ReferenceItem(type: .text, annotation: "My ref", textContent: "Some description"),
+            ReferenceItem(type: .image, annotation: "Image ref",
+                          mediaData: Data([0x01, 0x02, 0x03]),
+                          thumbnailData: Data([0x04, 0x05]))
+        ]
+        let projDoc = ProjectDocument(markdown: "# Project\n\nGoal: cool shader")
+        let designDoc = DesignDocument(markdown: "# Design\n\n## Approach\nUse SDF")
+
+        let doc = CanvasDocument(
+            name: "Lab Test",
+            mode: .twoDimensionalLab,
+            meshType: .sphere,
+            shaders: [ActiveShader(category: .fragment, name: "Main", code: "frag code")],
+            paramValues: ["_speed": [2.0]],
+            labSession: session,
+            references: refs,
+            projectDocument: projDoc,
+            designDoc: designDoc
+        )
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(doc)
+        let json = String(data: data, encoding: .utf8)!
+
+        #expect(json.contains("labSession"))
+        #expect(json.contains("references"))
+        #expect(json.contains("projectDocument"))
+        #expect(json.contains("designDoc"))
+        #expect(json.contains("chatMessages"))
+        #expect(json.contains("My ref"))
+        #expect(json.contains("cool shader"))
+        #expect(json.contains("Use SDF"))
+
+        let decoded = try JSONDecoder().decode(CanvasDocument.self, from: data)
+        #expect(decoded.name == "Lab Test")
+        #expect(decoded.mode == .twoDimensionalLab)
+
+        #expect(decoded.labSession != nil)
+        #expect(decoded.labSession!.chatMessages.count == 2)
+        #expect(decoded.labSession!.chatMessages[0].content == "Hello")
+        #expect(decoded.labSession!.currentPhase == .implementation)
+
+        #expect(decoded.references != nil)
+        #expect(decoded.references!.count == 2)
+        #expect(decoded.references![0].annotation == "My ref")
+        #expect(decoded.references![0].textContent == "Some description")
+        #expect(decoded.references![1].mediaData == Data([0x01, 0x02, 0x03]))
+
+        #expect(decoded.projectDocument != nil)
+        #expect(decoded.projectDocument!.markdown.contains("cool shader"))
+
+        #expect(decoded.designDoc != nil)
+        #expect(decoded.designDoc!.markdown.contains("Use SDF"))
+    }
+
+    @Test func roundTripLabViaCanvasActions() throws {
+        var session = LabSession()
+        session.chatMessages = [
+            ChatMessage(role: .user, content: "Test message")
+        ]
+        let refs = [ReferenceItem(type: .text, annotation: "Note", textContent: "Content")]
+        let projDoc = ProjectDocument(markdown: "# Doc")
+        let design = DesignDocument(markdown: "# Design")
+
+        let doc = CanvasActions.buildDocument(
+            name: "Lab Build", mode: .threeDimensionalLab, meshType: .sphere,
+            shape2DType: .roundedRectangle,
+            shaders: [], dataFlow: DataFlowConfig(), dataFlow2D: DataFlow2DConfig(),
+            paramValues: [:], objects2D: [],
+            sharedVertexCode2D: "", sharedFragmentCode2D: "",
+            labSession: session,
+            references: refs,
+            projectDocument: projDoc,
+            designDoc: design
+        )
+
+        #expect(doc.labSession != nil)
+        #expect(doc.labSession!.chatMessages.count == 1)
+        #expect(doc.references != nil)
+        #expect(doc.references!.count == 1)
+        #expect(doc.projectDocument != nil)
+        #expect(doc.designDoc != nil)
+
+        let data = try JSONEncoder().encode(doc)
+        let decoded = try JSONDecoder().decode(CanvasDocument.self, from: data)
+
+        #expect(decoded.labSession != nil)
+        #expect(decoded.labSession!.chatMessages.count == 1)
+        #expect(decoded.labSession!.chatMessages[0].content == "Test message")
+        #expect(decoded.references!.count == 1)
+        #expect(decoded.references![0].textContent == "Content")
+        #expect(decoded.projectDocument!.markdown == "# Doc")
+        #expect(decoded.designDoc!.markdown == "# Design")
+    }
 }

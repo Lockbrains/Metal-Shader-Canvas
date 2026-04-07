@@ -94,6 +94,11 @@ struct LabView: View {
     @State private var parameterSnapshots: [ParameterSnapshot] = []
     @State private var adversarialProposals: [AdversarialProposal] = []
 
+    // MARK: - Agent Checkpoint State
+
+    @State private var agentCheckpoints: [AgentCheckpoint] = []
+    private let maxCheckpoints = 20
+
     // MARK: - Panel State
 
     @State private var leftPanelTab: LeftPanelTab = .references
@@ -155,6 +160,10 @@ struct LabView: View {
                 dataFlow2DConfig: dataFlow2DConfig,
                 sharedVertexCode2D: sharedVertexCode2D,
                 sharedFragmentCode2D: sharedFragmentCode2D,
+                references: references,
+                designDocMarkdown: designDoc.markdown,
+                projectDocMarkdown: projectDocument.markdown,
+                chatMessageCount: chatStore.messages.count,
                 onChanged: { hasUnsavedChanges = true }
             ))
     }
@@ -558,7 +567,9 @@ struct LabView: View {
                     sharedFragmentCode2D: sharedFragmentCode2D,
                     compilationError: compilationError,
                     meshType: meshType,
-                    onAgentActions: { actions in executeAgentActions(actions) }
+                    onAgentActions: { actions in executeAgentActions(actions) },
+                    onCaptureCheckpoint: { messageID in captureCheckpoint(for: messageID) },
+                    onRevertToCheckpoint: { messageID in revertToCheckpoint(for: messageID) }
                 )
             case .parameters:
                 ParameterTuningView(
@@ -814,6 +825,41 @@ struct LabView: View {
         }
     }
 
+    // MARK: - Agent Checkpoints
+
+    private func captureCheckpoint(for messageID: UUID) {
+        let doc = CanvasActions.buildDocument(
+            name: canvasName, mode: canvasMode, meshType: meshType,
+            shape2DType: shape2DType, shaders: activeShaders,
+            dataFlow: dataFlowConfig, dataFlow2D: dataFlow2DConfig,
+            paramValues: paramValues, objects2D: objects2D,
+            sharedVertexCode2D: sharedVertexCode2D,
+            sharedFragmentCode2D: sharedFragmentCode2D,
+            references: references.isEmpty ? nil : references,
+            projectDocument: projectDocument.isEmpty ? nil : projectDocument,
+            designDoc: designDoc.isEmpty ? nil : designDoc
+        )
+        agentCheckpoints.append(AgentCheckpoint(messageID: messageID, document: doc))
+        if agentCheckpoints.count > maxCheckpoints {
+            agentCheckpoints.removeFirst()
+        }
+    }
+
+    private func revertToCheckpoint(for messageID: UUID) {
+        guard let checkpoint = agentCheckpoints.first(where: { $0.messageID == messageID }) else { return }
+        let doc = checkpoint.document
+        activeShaders = doc.shaders
+        objects2D = doc.objects2D ?? []
+        sharedVertexCode2D = doc.sharedVertexCode2D ?? ""
+        sharedFragmentCode2D = doc.sharedFragmentCode2D ?? ""
+        dataFlowConfig = doc.dataFlow
+        dataFlow2DConfig = doc.dataFlow2D
+        paramValues = doc.paramValues
+        if let dd = doc.designDoc { designDoc = dd }
+        if let pd = doc.projectDocument { projectDocument = pd }
+        if let refs = doc.references { references = refs }
+    }
+
     private func executeAgentActions(_ actions: [AgentAction]) {
         applyDataFlowActions(actions)
 
@@ -915,6 +961,21 @@ struct LabView: View {
         session.adversarialProposals = adversarialProposals
         session.chatMessages = chatStore.messages
         session.lastModified = Date()
+
+        print("[LAB-SAVE] ──────────────────────────────────────")
+        print("[LAB-SAVE] canvasName: \(canvasName)")
+        print("[LAB-SAVE] canvasMode: \(canvasMode.rawValue)")
+        print("[LAB-SAVE] shaders: \(activeShaders.count)")
+        print("[LAB-SAVE] objects2D: \(objects2D.count)")
+        print("[LAB-SAVE] chatMessages: \(session.chatMessages.count)")
+        print("[LAB-SAVE] references: \(references.count)")
+        print("[LAB-SAVE] designDoc.isEmpty: \(designDoc.isEmpty)  markdown: \(designDoc.markdown.prefix(80))")
+        print("[LAB-SAVE] projectDocument.isEmpty: \(projectDocument.isEmpty)  markdown: \(projectDocument.markdown.prefix(80))")
+        print("[LAB-SAVE] parameterSnapshots: \(parameterSnapshots.count)")
+        print("[LAB-SAVE] adversarialProposals: \(adversarialProposals.count)")
+        print("[LAB-SAVE] paramValues keys: \(Array(paramValues.keys))")
+        print("[LAB-SAVE] ──────────────────────────────────────")
+
         let doc = CanvasActions.buildDocument(
             name: canvasName, mode: canvasMode, meshType: meshType,
             shape2DType: shape2DType, shaders: activeShaders,
@@ -927,8 +988,16 @@ struct LabView: View {
             projectDocument: projectDocument.isEmpty ? nil : projectDocument,
             designDoc: designDoc.isEmpty ? nil : designDoc
         )
+
+        print("[LAB-SAVE] doc.labSession nil? \(doc.labSession == nil)")
+        print("[LAB-SAVE] doc.references nil? \(doc.references == nil)  count: \(doc.references?.count ?? 0)")
+        print("[LAB-SAVE] doc.projectDocument nil? \(doc.projectDocument == nil)")
+        print("[LAB-SAVE] doc.designDoc nil? \(doc.designDoc == nil)")
+
         do {
             try CanvasActions.saveDocument(doc, to: url)
+            let fileSize = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
+            print("[LAB-SAVE] ✓ Saved to \(url.lastPathComponent)  size: \(fileSize) bytes")
             currentFileURL = url
             hasUnsavedChanges = false
             let savedName = canvasName
@@ -950,6 +1019,14 @@ struct LabView: View {
     private func openCanvas(from url: URL) {
         do {
             let doc = try CanvasActions.loadDocument(from: url)
+            let fileSize = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
+            print("[LAB-LOAD] ──────────────────────────────────────")
+            print("[LAB-LOAD] file: \(url.lastPathComponent)  size: \(fileSize) bytes")
+            print("[LAB-LOAD] doc.labSession nil? \(doc.labSession == nil)  chatMessages: \(doc.labSession?.chatMessages.count ?? 0)")
+            print("[LAB-LOAD] doc.references nil? \(doc.references == nil)  count: \(doc.references?.count ?? 0)")
+            print("[LAB-LOAD] doc.projectDocument nil? \(doc.projectDocument == nil)")
+            print("[LAB-LOAD] doc.designDoc nil? \(doc.designDoc == nil)")
+            print("[LAB-LOAD] ──────────────────────────────────────")
             canvasMode = doc.mode
             canvasName = doc.name
             meshType = doc.meshType
@@ -1020,6 +1097,10 @@ private struct LabChangeTrackingModifier: ViewModifier {
     let dataFlow2DConfig: DataFlow2DConfig
     let sharedVertexCode2D: String
     let sharedFragmentCode2D: String
+    let references: [ReferenceItem]
+    let designDocMarkdown: String
+    let projectDocMarkdown: String
+    let chatMessageCount: Int
     let onChanged: () -> Void
 
     func body(content: Content) -> some View {
@@ -1032,5 +1113,9 @@ private struct LabChangeTrackingModifier: ViewModifier {
             .onChange(of: dataFlow2DConfig) { onChanged() }
             .onChange(of: sharedVertexCode2D) { onChanged() }
             .onChange(of: sharedFragmentCode2D) { onChanged() }
+            .onChange(of: references.count) { onChanged() }
+            .onChange(of: designDocMarkdown) { onChanged() }
+            .onChange(of: projectDocMarkdown) { onChanged() }
+            .onChange(of: chatMessageCount) { onChanged() }
     }
 }

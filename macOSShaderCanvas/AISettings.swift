@@ -157,11 +157,11 @@ nonisolated struct ChatMessage: Identifiable, Codable, Sendable {
         case executedActions, executedLabActions, barriers, thinking, plan
     }
 
-    init(role: MessageRole, content: String, executedActions: [AgentAction]? = nil,
+    init(id: UUID = UUID(), role: MessageRole, content: String, executedActions: [AgentAction]? = nil,
          executedLabActions: [LabAction]? = nil, barriers: [String]? = nil,
          thinking: String? = nil, plan: AgentPlan? = nil,
          renderSnapshot: Data? = nil, userImage: Data? = nil) {
-        self.id = UUID()
+        self.id = id
         self.role = role
         self.content = content
         self.timestamp = Date()

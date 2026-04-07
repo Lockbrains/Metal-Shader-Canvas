@@ -459,6 +459,16 @@ struct CanvasDocument: Codable {
     }
 }
 
+// MARK: - Agent Checkpoint
+
+/// A frozen snapshot of the full workspace state taken before an agent turn executes.
+/// Enables one-click rollback of agent operations. Keyed by the chat message ID
+/// that triggered the captured actions, so the UI can offer per-message revert.
+struct AgentCheckpoint {
+    let messageID: UUID
+    let document: CanvasDocument
+}
+
 // MARK: - Recent Project (Hub)
 
 /// Metadata for a recently-opened project, displayed in the Hub window.

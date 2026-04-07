@@ -180,6 +180,11 @@ struct ContentView: View {
     /// Last shader compilation error message (nil = compilation OK).
     @State private var compilationError: String? = nil
     
+    // MARK: - Agent Checkpoint State
+
+    @State private var agentCheckpoints: [AgentCheckpoint] = []
+    private let maxCheckpoints = 20
+
     // MARK: - Undo Delete State
 
     /// Stores the most recently deleted shader for undo functionality.
@@ -694,7 +699,9 @@ struct ContentView: View {
                         rotationAngle: Float(rotationAngle),
                         selectedObjectID: selectedObjectID,
                         onGenerateTutorial: { steps in loadAITutorial(steps) },
-                        onAgentActions: { actions in executeAgentActions(actions) }
+                        onAgentActions: { actions in executeAgentActions(actions) },
+                        onCaptureCheckpoint: { messageID in captureCheckpoint(for: messageID) },
+                        onRevertToCheckpoint: { messageID in revertToCheckpoint(for: messageID) }
                     )
                     .frame(width: 420)
                     .padding(.top, 48)
@@ -847,6 +854,36 @@ struct ContentView: View {
         }
         lastDeletedShader = nil
         withAnimation { showUndoToast = false }
+    }
+
+    // MARK: - Agent Checkpoints
+
+    private func captureCheckpoint(for messageID: UUID) {
+        let doc = CanvasDocument(
+            name: canvasName, mode: canvasMode, meshType: meshType,
+            shape2DType: shape2DType, shaders: activeShaders,
+            dataFlow: dataFlowConfig, dataFlow2D: dataFlow2DConfig,
+            paramValues: paramValues,
+            objects2D: objects2D.isEmpty ? nil : objects2D,
+            sharedVertexCode2D: sharedVertexCode2D,
+            sharedFragmentCode2D: sharedFragmentCode2D
+        )
+        agentCheckpoints.append(AgentCheckpoint(messageID: messageID, document: doc))
+        if agentCheckpoints.count > maxCheckpoints {
+            agentCheckpoints.removeFirst()
+        }
+    }
+
+    private func revertToCheckpoint(for messageID: UUID) {
+        guard let checkpoint = agentCheckpoints.first(where: { $0.messageID == messageID }) else { return }
+        let doc = checkpoint.document
+        activeShaders = doc.shaders
+        objects2D = doc.objects2D ?? []
+        sharedVertexCode2D = doc.sharedVertexCode2D ?? ""
+        sharedFragmentCode2D = doc.sharedFragmentCode2D ?? ""
+        dataFlowConfig = doc.dataFlow
+        dataFlow2DConfig = doc.dataFlow2D
+        paramValues = doc.paramValues
     }
 
     // MARK: - AI Agent Actions
